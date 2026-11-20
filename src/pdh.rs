@@ -16,7 +16,7 @@ pub struct Pdh {
     buf: Vec<u8>,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Sample {
     /// pid → % GPU (moteur le plus chargé, comme le Gestionnaire)
     pub gpu: HashMap<u32, f32>,

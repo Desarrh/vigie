@@ -73,6 +73,9 @@ pub struct Snapshot {
     pub parts: String,
 }
 
+/// Intervalle de mesure quand la fenêtre est réduite.
+pub const BACKGROUND_INTERVAL: Duration = Duration::from_secs(10);
+
 pub enum Cmd {
     Interval(Duration),
     Gpu(bool),
@@ -118,6 +121,7 @@ fn run(rx: Receiver<Cmd>, mut interval: Duration, mut gpu: bool, out: impl Fn(Ar
     let mut ports_arc: HashMap<u32, Arc<[Port]>> = HashMap::new();
     let empty_ports: Arc<[Port]> = Arc::from(Vec::new());
     let mut names: HashMap<String, Arc<str>> = HashMap::new();
+    let mut last_pdh = crate::pdh::Sample::default();
     loop {
         let t0 = Instant::now();
         let raws = sys::query_processes(&mut buf);
@@ -138,7 +142,16 @@ fn run(rx: Receiver<Cmd>, mut interval: Duration, mut gpu: bool, out: impl Fn(Ar
             ports_arc = ports.iter().map(|(k, v)| (*k, Arc::from(v.clone()))).collect();
         }
         let t_ports = t0.elapsed();
-        let pdhs = pdh.as_mut().map(|p| p.sample()).unwrap_or_default();
+        // En arrière-plan (fenêtre réduite) : pas de compteurs PDH (GPU, disque, réseau ≈ 2,6 ms),
+        // on garde les dernières valeurs. Restent la lecture noyau (pics de RAM des jeux, chasseur)
+        // et les fenêtres ; les ports une mesure sur trois.
+        let pdhs = if background {
+            last_pdh.clone()
+        } else {
+            let s = pdh.as_mut().map(|p| p.sample()).unwrap_or_default();
+            last_pdh = s.clone();
+            s
+        };
         let t_pdh = t0.elapsed();
 
         let ctime_of: HashMap<u32, i64> = raws.iter().map(|r| (r.pid, r.create_time)).collect();
@@ -240,7 +253,8 @@ fn run(rx: Receiver<Cmd>, mut interval: Duration, mut gpu: bool, out: impl Fn(Ar
         let _ = &ports;
 
         // Attente jusqu'à la prochaine mesure — ou une commande.
-        let wait = if background { interval.max(Duration::from_secs(3)) } else { interval };
+        // réduite : une mesure toutes les 10 s au plus (CPU ≈ 0 au repos, règle 1)
+        let wait = if background { interval.max(BACKGROUND_INTERVAL) } else { interval };
         let deadline = Instant::now() + wait.saturating_sub(t0.elapsed());
         loop {
             let left = deadline.saturating_duration_since(Instant::now());

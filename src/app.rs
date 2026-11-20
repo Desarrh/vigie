@@ -239,7 +239,11 @@ pub struct IconEntry {
     pub desc: Option<String>,
 }
 
+/// Réveil de la boucle d'événements à chaque mesure (posé par `main`).
+pub type Waker = Arc<std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>>;
+
 pub struct App {
+    pub waker: Waker,
     pub ctx: egui::Context,
     pub s: Settings,
     pub pal: Palette,
@@ -313,12 +317,18 @@ impl App {
         });
         let (tx, rx) = std::sync::mpsc::channel();
         let c2 = ctx.clone();
+        let waker: Waker = Arc::new(std::sync::OnceLock::new());
+        let w2 = waker.clone();
         let docker_running = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let c4 = ctx.clone();
         let docker = crate::docker::spawn(docker_running.clone(), move || c4.request_repaint());
         let cmd = sampler::spawn(Duration::from_millis(s.interval_ms), s.gpu, move |snap| {
             let _ = tx.send(snap);
-            c2.request_repaint();
+            // fenêtre réduite : egui ne relaie plus les demandes de dessin, la boucle est réveillée directement
+            match w2.get() {
+                Some(w) => w(),
+                None => c2.request_repaint(),
+            }
         });
         // Icônes et descriptions des exe, chargées à la demande hors du thread d'interface.
         let (icon_tx, irx) = std::sync::mpsc::channel::<Arc<str>>();
@@ -385,6 +395,7 @@ impl App {
             last_frame_ms: 0.0,
             minimized: false,
             headless: false,
+            waker,
             game_freed: 0,
             startup: None,
             docker,

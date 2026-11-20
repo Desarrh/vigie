@@ -39,6 +39,8 @@ enum UserEvent {
     RepaintAt(Instant),
     /// une autre instance a été lancée (Ctrl+Maj+Échap, raccourci…) : ramener la fenêtre
     Front,
+    /// nouvelle mesure arrivée
+    Sample,
 }
 
 struct Runner {
@@ -47,6 +49,7 @@ struct Runner {
     app: Option<app::App>,
     settings: Option<app::Settings>,
     next_repaint: Option<Instant>,
+    proxy: winit::event_loop::EventLoopProxy<UserEvent>,
 }
 
 impl Runner {
@@ -105,13 +108,18 @@ impl ApplicationHandler<UserEvent> for Runner {
             .with_window_icon(window_icon());
         // Règle n°0 : en test (--test-hors-ecran), fenêtre hors écran, sans focus, hors barre des tâches.
         let test = socle::testmode::enabled();
-        let attrs = if test { attrs.with_active(false).with_position(winit::dpi::PhysicalPosition::new(-32000, -32000)) } else { attrs };
+        // socle v0.1.2 : invisible et sans focus à la création, puis `hide` (opacité 0, au fond de la pile, à l'écran pour rester dessinée)
+        let attrs = if test { attrs.with_visible(false).with_active(false) } else { attrs };
         let window = Rc::new(el.create_window(attrs).expect("création de la fenêtre"));
         if test {
             use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
             if let Ok(h) = window.window_handle() {
                 if let RawWindowHandle::Win32(w) = h.as_raw() {
                     socle::testmode::hide(w.hwnd.get());
+                    // mesure du mode arrière-plan : réduite sans activer (aucun changement de focus)
+                    if std::env::var_os("VIGIE_TEST_REDUIT").is_some() {
+                        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(w.hwnd.get() as _, windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWMINNOACTIVE) };
+                    }
                 }
             }
         }
@@ -122,6 +130,10 @@ impl ApplicationHandler<UserEvent> for Runner {
         if self.app.is_none() {
             let s = self.settings.take().unwrap_or_default();
             let mut a = app::App::new(&self.ctx, s);
+            let px = self.proxy.clone();
+            let _ = a.waker.set(Box::new(move || {
+                let _ = px.send_event(UserEvent::Sample);
+            }));
             if let Some(msg) = socle::crash::pending("Vigie") {
                 a.toast(msg, true);
             }
@@ -166,6 +178,18 @@ impl ApplicationHandler<UserEvent> for Runner {
     fn user_event(&mut self, _el: &ActiveEventLoop, ev: UserEvent) {
         let t = match ev {
             UserEvent::RepaintAt(t) => t,
+            UserEvent::Sample => {
+                // réduite : on traite la mesure sans dessiner ; sinon une image normale
+                match self.app.as_mut() {
+                    Some(app) if app.minimized => app.tick(),
+                    _ => {
+                        if let Some(g) = &self.gfx {
+                            g.window.request_redraw();
+                        }
+                    }
+                }
+                return;
+            }
             UserEvent::Front => {
                 if let Some(g) = &self.gfx {
                     g.window.set_minimized(false);
@@ -375,6 +399,7 @@ fn main() {
     }
     let event_loop = EventLoop::<UserEvent>::with_user_event().build().expect("boucle d’événements");
     let proxy = event_loop.create_proxy();
+    let proxy_app = proxy.clone();
     if let Some(i) = instance {
         let p = proxy.clone();
         i.listen(move |_args| {
@@ -385,6 +410,6 @@ fn main() {
     ctx.set_request_repaint_callback(move |info| {
         let _ = proxy.send_event(UserEvent::RepaintAt(Instant::now() + info.delay));
     });
-    let mut runner = Runner { ctx, gfx: None, app: None, settings: Some(app::Settings::load()), next_repaint: None };
+    let mut runner = Runner { ctx, gfx: None, app: None, settings: Some(app::Settings::load()), next_repaint: None, proxy: proxy_app };
     let _ = event_loop.run_app(&mut runner);
 }

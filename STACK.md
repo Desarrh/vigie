@@ -5,7 +5,7 @@
 Vigie est le gestionnaire de tâches Windows de l'utilisateur. Il remplace le Gestionnaire des tâches de Windows (option Ctrl+Maj+Échap) et intègre un **chasseur de RAM fantôme** : il repère ce qui tourne pour rien (serveurs de dev oubliés, orphelins, apps cachées, Docker/WSL) et propose de le nettoyer, surtout avant de jouer.
 
 Principes :
-- **Légèreté mesurée** : 48,6 Mo de mémoire privée au repos avec V1–V4 (47,4 Mo avant le socle, 48,0 après, fenêtre hors écran, `scratchpad/mesure.ps1`), ~3,3 % d'un cœur avec une mesure par seconde (identique avant/après), ~7 ms de mesure par seconde sur un seul thread, ~3–5 ms par image, exe de ~5,8 Mo.
+- **Légèreté mesurée** (socle v0.1.2, fenêtre de test invisible qui dessine vraiment, `scratchpad/mesure.ps1`, 60 s au repos) : **fenêtre ouverte** 34,5 Mo privés, 1,5 % d'un cœur (une mesure + une image par seconde) ; **fenêtre réduite** 13 Mo, **0,10 % d'un cœur** (une mesure toutes les 10 s, sans compteurs PDH, aucune image). Exe ~5,8 Mo.
 - **Zéro coût fermé** : pas de service, de tray ni de démarrage auto.
 - **Rien n'est redessiné sans raison** : l'interface attend une mesure ou une action.
 - **Prudence** : rien n'est tué sans confirmation ou case cochée. Liste de processus protégés. Services et session 0 jamais proposés.
@@ -14,7 +14,7 @@ Principes :
 ## 2. Stack
 
 - **Langage** : Rust, édition 2024 (rustc 1.99). Crate `vigie` v0.1.0.
-- **Socle commun** : crate `socle` (tag v0.1.0, `https://github.com/Desarrh/socle`), features `ui`, `settings`, `crash`, `instance`, `testmode` : thème, icônes vectorielles, palette Ctrl+K, autocomplétion floue, toasts, raccourcis AZERTY, instance unique, journal de plantage, mode test. En local, `.cargo/config.toml` (non versionné) le remplace par `../socle`.
+- **Socle commun** : crate `socle` (tag v0.1.2, `https://github.com/Desarrh/socle`), features `ui`, `settings`, `crash`, `instance`, `testmode` : thème, icônes vectorielles, palette Ctrl+K, autocomplétion floue, toasts, raccourcis AZERTY, instance unique, journal de plantage, mode test. En local, `.cargo/config.toml` (non versionné) le remplace par `../socle`.
 - **Interface** : `egui` 0.37.0, `egui-winit` 0.37.0 (clipboard, links), `winit` 0.30.13.
 - **Rendu CPU** : `softbuffer` 0.4.8 (présentation GDI), `hdrshot-egui-backend` 0.2.0 (rastériseur logiciel, importé comme `egui_software_backend`), `bytemuck` 1. Il n'y a **aucun contexte GPU**.
 - **Données** : `serde` 1 + `serde_json` 1 (réglages, journal, sortie `docker`), `image` 0.25.10 (PNG seulement : icône, captures de debug), `dirs` 7.0.0.
@@ -58,7 +58,7 @@ Principes :
 
 **Threads**
 - **Interface** (winit) : en `ControlFlow::Wait`, il ne redessine que sur un événement, une mesure reçue, ou un `request_repaint` (toast, icône).
-- **« echantillonnage »** : boucle mesure → envoi `Arc<Snapshot>` par `mpsc` → `ctx.request_repaint()`. Il attend ensuite sur `recv_timeout` du canal de commandes (intervalle, GPU, mesure immédiate, arrière-plan). Fenêtre réduite ou masquée : au moins 3 s entre deux mesures, ports une mesure sur trois.
+- **« echantillonnage »** : boucle mesure → envoi `Arc<Snapshot>` par `mpsc` → réveil de la boucle (`UserEvent::Sample`, pas `request_repaint` : egui ne relaie plus les demandes quand aucune image n'est dessinée). Fenêtre réduite : la mesure est traitée sans dessiner (pics des jeux V3, boîte noire V4, chasseur restent à jour). Il attend ensuite sur `recv_timeout` du canal de commandes (intervalle, GPU, mesure immédiate, arrière-plan). Fenêtre réduite : au moins 10 s entre deux mesures (`BACKGROUND_INTERVAL`), compteurs PDH (GPU, disque, réseau) coupés, ports une mesure sur trois.
 - **« icones »** : il reçoit les chemins d'exe et renvoie l'icône RGBA et la description. Chaque chemin n'est chargé qu'une fois.
 - **« docker »** : il dort 5 s tant que Docker est arrêté, puis interroge toutes les 20 s.
 
