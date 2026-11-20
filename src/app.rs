@@ -2,12 +2,12 @@
 use crate::hunter::{self, Fix, Ghost};
 use crate::sampler::{self, Cmd, Key, Proc, Snapshot};
 use crate::sys::{self, Prio};
-use crate::theme::{self, Palette};
+use socle::theme::{self, Palette};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub const HIST: usize = 120;
 
@@ -90,6 +90,8 @@ pub struct Settings {
     pub game_power: bool,
     /// plan d'alimentation à restaurer en quittant le mode jeu
     pub prev_power: Option<String>,
+    /// historique de la recherche (autocomplétion)
+    pub search_history: socle::autocomplete::History,
 }
 
 impl Default for Settings {
@@ -114,6 +116,7 @@ impl Default for Settings {
             game_trim: true,
             game_power: true,
             prev_power: None,
+            search_history: Default::default(),
         }
     }
 }
@@ -194,11 +197,6 @@ pub enum Confirm {
     Kill { keys: Vec<Key>, tree: bool, names: String },
 }
 
-pub struct Palette2 {
-    pub query: String,
-    pub sel: usize,
-    pub just_opened: bool,
-}
 
 pub enum Action {
     Kill(Vec<Key>, bool),
@@ -254,9 +252,13 @@ pub struct App {
     pub collapsed: HashSet<Key>,
     pub ghosts: Vec<Ghost>,
     pub checked: HashMap<Key, bool>,
-    pub toast: Option<(String, Instant, bool)>,
+    pub toasts: socle::ui::Toasts,
     pub confirm: Option<Confirm>,
-    pub palette: Option<Palette2>,
+    pub palette: socle::ui::Palette,
+    /// recherche : autocomplétion floue (historique + noms, descriptions, ports en cours)
+    pub search_ac: socle::autocomplete::Autocomplete,
+    pub search_field: socle::ui::AutoField,
+    search_cands: Vec<String>,
     pub help: bool,
     pub game_dialog: bool,
     pub game_active: bool,
@@ -345,9 +347,12 @@ impl App {
             collapsed: HashSet::new(),
             ghosts: Vec::new(),
             checked: HashMap::new(),
-            toast: None,
+            toasts: Default::default(),
             confirm: None,
-            palette: None,
+            palette: Default::default(),
+            search_ac: socle::autocomplete::Autocomplete::new(s.search_history.clone()),
+            search_field: Default::default(),
+            search_cands: Vec::new(),
             help: false,
             game_dialog: false,
             game_active,
@@ -378,8 +383,13 @@ impl App {
     }
 
     pub fn toast(&mut self, msg: impl Into<String>, err: bool) {
-        self.toast = Some((msg.into(), Instant::now(), err));
-        self.ctx.request_repaint_after(Duration::from_secs(5));
+        if err { self.toasts.error(msg) } else { self.toasts.ok(msg) }
+        self.ctx.request_repaint();
+    }
+
+    /// Dernier message affiché (mode sans fenêtre : résumé imprimé sur stdout).
+    pub fn last_toast(&self) -> Option<String> {
+        self.toasts.current().map(|t| t.msg.clone())
     }
 
     pub fn set_background(&mut self, b: bool) {
@@ -424,11 +434,6 @@ impl App {
         }
         if let Some(snap) = latest {
             self.on_snapshot(snap);
-        }
-        if let Some((_, t, _)) = &self.toast {
-            if t.elapsed() > Duration::from_secs(5) {
-                self.toast = None;
-            }
         }
     }
 
@@ -481,13 +486,27 @@ impl App {
                 }
             }
         }
-        if self.palette.is_none() && self.hist.cpu.0.len() == 2 {
+        if !self.palette.is_open() && self.hist.cpu.0.len() == 2 {
             if std::env::var_os("VIGIE_GAME").is_some() {
                 self.game_dialog = true;
             }
-            if let Ok(q) = std::env::var("VIGIE_PALETTE") {
-                self.palette = Some(Palette2 { query: q, sel: 0, just_opened: true });
+            if std::env::var_os("VIGIE_PALETTE").is_some() {
+                self.palette.open();
             }
+        }
+        let mut cands: Vec<String> = Vec::with_capacity(snap.procs.len() + 32);
+        for p in &snap.procs {
+            cands.push(p.name.to_string());
+            if let Some(d) = p.path.as_ref().and_then(|pa| self.icons.get(pa)).and_then(|e| e.desc.clone()) {
+                cands.push(d);
+            }
+            cands.extend(p.ports.iter().filter(|x| x.tcp).map(|x| format!(":{}", x.port)));
+        }
+        cands.sort();
+        cands.dedup();
+        if cands != self.search_cands {
+            self.search_ac.set_candidates(cands.iter().cloned());
+            self.search_cands = cands;
         }
         self.snap = Some(snap);
         self.rows_dirty = true;
@@ -512,7 +531,8 @@ impl App {
                 return p.ports.iter().any(|x| x.port.to_string().starts_with(port));
             }
             q.split_whitespace().all(|w| {
-                p.name.to_lowercase().contains(w)
+                socle::fuzzy::score(&p.name, w).is_some()
+                    || p.path.as_deref().and_then(|pa| self.icons.get(pa)).and_then(|e| e.desc.as_deref()).map(|d| socle::fuzzy::score(d, w).is_some()).unwrap_or(false)
                     || p.key.pid.to_string() == w
                     || p.window.as_deref().map(|t| t.to_lowercase().contains(w)).unwrap_or(false)
                     || p.path.as_deref().and_then(|pa| self.icons.get(pa)).and_then(|e| e.desc.as_deref()).map(|d| d.to_lowercase().contains(w)).unwrap_or(false)

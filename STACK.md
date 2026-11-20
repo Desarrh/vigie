@@ -5,7 +5,7 @@
 Vigie est le gestionnaire de tâches Windows de l'utilisateur. Il remplace le Gestionnaire des tâches de Windows (option Ctrl+Maj+Échap) et intègre un **chasseur de RAM fantôme** : il repère ce qui tourne pour rien (serveurs de dev oubliés, orphelins, apps cachées, Docker/WSL) et propose de le nettoyer, surtout avant de jouer.
 
 Principes :
-- **Légèreté mesurée** : ~45–55 Mo de mémoire privée, ~7 ms de mesure par seconde sur un seul thread, ~3–5 ms par image, exe de ~5,8 Mo.
+- **Légèreté mesurée** : 48 Mo de mémoire privée au repos (47,4 Mo avant le socle, fenêtre hors écran, `scratchpad/mesure.ps1`), ~3,3 % d'un cœur avec une mesure par seconde (identique avant/après), ~7 ms de mesure par seconde sur un seul thread, ~3–5 ms par image, exe de ~5,8 Mo.
 - **Zéro coût fermé** : pas de service, de tray ni de démarrage auto.
 - **Rien n'est redessiné sans raison** : l'interface attend une mesure ou une action.
 - **Prudence** : rien n'est tué sans confirmation ou case cochée. Liste de processus protégés. Services et session 0 jamais proposés.
@@ -14,6 +14,7 @@ Principes :
 ## 2. Stack
 
 - **Langage** : Rust, édition 2024 (rustc 1.99). Crate `vigie` v0.1.0.
+- **Socle commun** : crate `socle` (tag v0.1.0, `https://github.com/Desarrh/socle`), features `ui`, `settings`, `crash`, `instance`, `testmode` : thème, icônes vectorielles, palette Ctrl+K, autocomplétion floue, toasts, raccourcis AZERTY, instance unique, journal de plantage, mode test. En local, `.cargo/config.toml` (non versionné) le remplace par `../socle`.
 - **Interface** : `egui` 0.37.0, `egui-winit` 0.37.0 (clipboard, links), `winit` 0.30.13.
 - **Rendu CPU** : `softbuffer` 0.4.8 (présentation GDI), `hdrshot-egui-backend` 0.2.0 (rastériseur logiciel, importé comme `egui_software_backend`), `bytemuck` 1. Il n'y a **aucun contexte GPU**.
 - **Données** : `serde` 1 + `serde_json` 1 (réglages, journal, sortie `docker`), `image` 0.25.10 (PNG seulement : icône, captures de debug), `dirs` 7.0.0.
@@ -53,7 +54,6 @@ Principes :
 | `cli.rs` | Interface sans fenêtre pour les autres applis : `--etat-dev`, `--couper-dev`, réveil des apps endormies (JSON) |
 | `journal.rs` | Journal des nettoyages en JSONL (append, lecture des N derniers jours, compactage à 90 jours) |
 | `winfo.rs` | Description lisible d'un exe (ressource `FileDescription`) |
-| `theme.rs` | Palette crème / bleu nuit, styles egui, polices |
 
 **Threads**
 - **Interface** (winit) : en `ControlFlow::Wait`, il ne redessine que sur un événement, une mesure reçue, ou un `request_repaint` (toast, icône).
@@ -68,7 +68,7 @@ Principes :
 
 ## 4. Direction artistique
 
-Elle est définie dans `src/theme.rs`. C'est la **copie du `theme.rs` du lecteur universel**, c'est-à-dire celui de l'Explorateur plus la famille de police « bold » et les emoji. Les 20 couleurs sont identiques à celles de l'Explorateur.
+Elle vient du **socle** (`socle::theme`, `socle::icons`, `socle::ui`) depuis la migration : plus de copie locale de `theme.rs`. Les 20 couleurs sont celles de l'Explorateur, identiques à avant.
 
 | Rôle | Sombre (défaut) | Clair |
 |---|---|---|
@@ -117,7 +117,7 @@ Elle est définie dans `src/theme.rs`. C'est la **copie du `theme.rs` du lecteur
 - Vues Chasseur et Démarrage : 24×18. Performances : 20×16.
 
 **Icônes**
-- Caractères Unicode et emoji, sans pack d'icônes : ☰ 👻 📈 ⏻ 🎮 🔍 ⋯ ☀/🌙 🌳 ⏸ 🛡 🐳.
+- **Icônes vectorielles du socle** (grille 24, trait 1,8, couleur du thème), plus aucun emoji : `ListView`, `Ghost`, `Chart`, `Power` (vues), `Gamepad`, `Broom`, `Shield`, `Sun`/`Moon`, `More`, `Tree`, `Pause`, `ChevronUp/Down/Right`, `Folder`, `Check`, `Refresh` ; catégories du chasseur : `Code`, `Block`, `Settings`, `Eye`, `Sleep`, `Container`, `Terminal`. Boutons via `icons::button` (32 px, `Look::tool` / `Look::active`) et `icons::wide`.
 - Les vraies icônes des exe sont extraites via le shell : 16 px dans la liste, 18 px dans le chasseur et le démarrage.
 - Logo : `assets/make_icon.py`. Carré crème arrondi, courbe d'activité bleue `#2E5E9E`, point orange `#F28C32`. Il reprend les couleurs de l'icône de l'Explorateur.
 
@@ -129,7 +129,7 @@ Elle est définie dans `src/theme.rs`. C'est la **copie du `theme.rs` du lecteur
 - Bouton thème ☀/🌙 et menu ⋯ à droite.
 - En-têtes de colonnes cliquables avec ▲▼.
 - Liste virtualisée `show_rows`.
-- Palette Ctrl+P/K : fond assombri, `Area` à 90 px du haut, ombre 0/12/40.
+- Contrôle segmenté, palette Ctrl+K, champ de recherche avec autocomplétion et toasts : composants du socle (`socle::ui::{segmented, Palette, autocomplete_field, Toasts}`).
 - Modales `Window` centrées (bouton destructif sur `del`).
 - Toasts dans la barre d'état, rendu softbuffer, journal de plantage dans `%APPDATA%`.
 
@@ -147,9 +147,10 @@ Elle est définie dans `src/theme.rs`. C'est la **copie du `theme.rs` du lecteur
 
 | Touche | Action |
 |---|---|
-| Ctrl+K / Ctrl+P | Palette |
+| Ctrl+K (Ctrl+P en alias) | Palette de commandes du socle : floue, récents en tête, « Aller à X », « Terminer tous les X » |
 | Ctrl+F ou taper | Recherche |
-| Ctrl+Maj+P / F / G / D | Vues Processus / Chasseur (fantômes) / Graphiques / Démarrage (pas de Ctrl+chiffre : cassé en AZERTY, cf. DIRECTION.md) |
+| Ctrl+1 / 2 / 3 / 4 | Vues Processus / Chasseur / Performances / Démarrage — touche physique (`socle::keys`), marche en AZERTY |
+| Ctrl+Maj+P / F / G / D | Mêmes vues (alias par lettres) |
 | Ctrl+T | Arbre / liste à plat |
 | ↑↓ PgPréc PgSuiv Début Fin (+Maj) | Naviguer, étendre la sélection |
 | ← → | Replier / déplier |
@@ -175,7 +176,8 @@ Elle est définie dans `src/theme.rs`. C'est la **copie du `theme.rs` du lecteur
 - Handles Windows fermés par un `Drop`.
 
 **Lancement et UAC**
-- Exe portable, sans installation, instance unique (mutex `Local\Vigie-instance` + `FindWindowW("Vigie")`).
+- Exe portable, sans installation, instance unique du socle (`socle::instance`, mutex + tube nommé) : une 2e instance (Ctrl+Maj+Échap, raccourci) ramène la fenêtre. Ignorée en mode test et juste après une élévation.
+- Plantages : `socle::crash` (`%APPDATA%\Vigie\crash.log`), signalés par un toast au lancement suivant.
 - Démarre sans admin. « Relancer en admin » fait `ShellExecuteEx runas` avec `--after-elevate`, puis l'instance actuelle se ferme.
 - `--set-taskmgr on|off` : instance élevée éphémère qui écrit la clé IFEO.
 - `--avant-jeu` / `--apres-jeu` (`--json` en option) : sans fenêtre. `--apres-jeu` n'ouvre ni egui ni thread de mesure (~20 ms).
@@ -197,7 +199,7 @@ Elle est définie dans `src/theme.rs`. C'est la **copie du `theme.rs` du lecteur
 - Chasseur : serveurs de dev, orphelins, démons de build, apps en fond, lourds inactifs, VM WSL. Pré-coche « sûr », liste blanche. Inactivité estimée au lancement (« ≈ »).
 - Vue Performances (CPU, mémoire engagée/en veille, GPU, disque, réseau) et top consommateurs.
 - Mode « avant de jouer » : ne rétrograde jamais un plan déjà au maximum (l'utilisateur est en Ultimate Performance).
-- Palette de commandes.
+- Palette de commandes Ctrl+K (socle) ; recherche floue avec autocomplétion (historique, noms, descriptions, `:ports`), Tab pour compléter.
 
 **V2 (vérifiée)**
 - Vue Démarrage, avec la RAM actuelle de chaque app. L'interrupteur est testé sur une entrée factice.
@@ -223,7 +225,7 @@ Elle est définie dans `src/theme.rs`. C'est la **copie du `theme.rs` du lecteur
 ## 8. Limites connues / dette technique
 
 - **Fichiers trop gros** : `ui.rs` (1 726 lignes) et `app.rs` (1 086) gagneraient à être découpés par vue.
-- **Thème copié** dans chaque app, pas de crate partagée : toute retouche de la DA est à reporter dans 3 à 5 projets.
+- ~~Thème copié dans chaque app~~ : résolu, Vigie utilise le socle.
 - **Chasseur** :
   - inactivité mesurée seulement depuis l'ouverture de Vigie (estimation par CPU moyen sur la vie du processus) ;
   - listes de noms codées en dur (`DEV_TOOLS`, `BACKGROUND_APPS`, `PROTECTED`) ;

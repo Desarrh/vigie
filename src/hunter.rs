@@ -36,15 +36,16 @@ impl Kind {
             Kind::Wsl => "Machines virtuelles",
         }
     }
-    pub fn icon(self) -> &'static str {
+    pub fn icon(self) -> socle::icons::Icon {
+        use socle::icons::Icon;
         match self {
-            Kind::DevServer => "⌁",
-            Kind::Orphan => "⊘",
-            Kind::BuildDaemon => "⚙",
-            Kind::Background => "◌",
-            Kind::HeavyIdle => "⏾",
-            Kind::Docker => "🐳",
-            Kind::Wsl => "▣",
+            Kind::DevServer => Icon::Code,
+            Kind::Orphan => Icon::Block,
+            Kind::BuildDaemon => Icon::Settings,
+            Kind::Background => Icon::Eye,
+            Kind::HeavyIdle => Icon::Sleep,
+            Kind::Docker => Icon::Container,
+            Kind::Wsl => Icon::Terminal,
         }
     }
     pub const ORDER: [Kind; 7] = [Kind::DevServer, Kind::Docker, Kind::Orphan, Kind::BuildDaemon, Kind::Background, Kind::HeavyIdle, Kind::Wsl];

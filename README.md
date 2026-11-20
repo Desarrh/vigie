@@ -34,7 +34,7 @@ Jamais proposés : services, Windows, Vigie et ses parents, Claude Code / Claude
 **Journal** (en bas du chasseur) — Go récupérés sur 7 jours, coupable n°1, détail des dernières actions
 (`%APPDATA%\Vigie\journal.jsonl`, 90 jours conservés).
 
-**Démarrage** (Ctrl+Maj+D) — apps lancées avec Windows (registre Run utilisateur / machine / 32 bits, dossiers Démarrage),
+**Démarrage** (Ctrl+4) — apps lancées avec Windows (registre Run utilisateur / machine / 32 bits, dossiers Démarrage),
 avec la RAM qu'elles occupent en ce moment ; interrupteur pour les désactiver sans rien désinstaller (même mécanisme que
 le Gestionnaire des tâches, les entrées « tous les utilisateurs » demandent l'admin).
 
@@ -51,9 +51,9 @@ relit ses pages quand il en a besoin.
 
 | | |
 |---|---|
-| Ctrl+K / Ctrl+P | Palette de commandes (« jeu », « admin », nom d'un processus…) |
-| Taper / Ctrl+F | Rechercher : nom, description, PID, titre de fenêtre, ligne de commande, `:3000` = qui écoute sur ce port |
-| Ctrl+Maj+P / F / G / D | Processus / Chasseur (fantômes) / Graphiques / Démarrage — pas de Ctrl+chiffre, cassé en AZERTY |
+| Ctrl+K (ou Ctrl+P) | Palette de commandes floue (« jeu », « admin », nom d'un processus…) |
+| Taper / Ctrl+F | Recherche floue (accents, initiales, fautes) : nom, description, PID, titre, ligne de commande, `:3000` = qui écoute sur ce port. Suggestions (↓), Tab complète, historique |
+| Ctrl+1 / 2 / 3 / 4 (ou Ctrl+Maj+P / F / G / D) | Processus / Chasseur / Performances / Démarrage — marche en AZERTY |
 | ↑ ↓ PgPréc PgSuiv Début Fin (+Maj) | Naviguer (étendre la sélection) ; ← → replier / déplier |
 | Entrée | Basculer vers la fenêtre |
 | Suppr / Maj+Suppr | Terminer / terminer l'arborescence |

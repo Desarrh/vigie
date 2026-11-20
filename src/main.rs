@@ -10,7 +10,6 @@ mod pdh;
 mod sampler;
 mod startup;
 mod sys;
-mod theme;
 mod ui;
 mod winfo;
 
@@ -37,6 +36,8 @@ struct Gfx {
 
 enum UserEvent {
     RepaintAt(Instant),
+    /// une autre instance a été lancée (Ctrl+Maj+Échap, raccourci…) : ramener la fenêtre
+    Front,
 }
 
 struct Runner {
@@ -101,14 +102,29 @@ impl ApplicationHandler<UserEvent> for Runner {
             .with_inner_size(LogicalSize::new(w.max(820.0), h.max(500.0)))
             .with_min_inner_size(LogicalSize::new(820.0, 500.0))
             .with_window_icon(window_icon());
+        // Règle n°0 : en test (--test-hors-ecran), fenêtre hors écran, sans focus, hors barre des tâches.
+        let test = socle::testmode::enabled();
+        let attrs = if test { attrs.with_active(false).with_position(winit::dpi::PhysicalPosition::new(-32000, -32000)) } else { attrs };
         let window = Rc::new(el.create_window(attrs).expect("création de la fenêtre"));
+        if test {
+            use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            if let Ok(h) = window.window_handle() {
+                if let RawWindowHandle::Win32(w) = h.as_raw() {
+                    socle::testmode::hide(w.hwnd.get());
+                }
+            }
+        }
         let context = softbuffer::Context::new(window.clone()).expect("softbuffer");
         let surface = softbuffer::Surface::new(&context, window.clone()).expect("surface");
         let egui = egui_winit::State::new(self.ctx.clone(), egui::ViewportId::ROOT, &*window, Some(window.scale_factor() as f32), None, Some(8192));
         let renderer = EguiSoftwareRender::new(ColorFieldOrder::Bgra);
         if self.app.is_none() {
             let s = self.settings.take().unwrap_or_default();
-            self.app = Some(app::App::new(&self.ctx, s));
+            let mut a = app::App::new(&self.ctx, s);
+            if let Some(msg) = socle::crash::pending("Vigie") {
+                a.toast(msg, true);
+            }
+            self.app = Some(a);
         }
         window.request_redraw();
         self.gfx = Some(Gfx { window, egui, _context: context, surface, renderer });
@@ -147,7 +163,17 @@ impl ApplicationHandler<UserEvent> for Runner {
     }
 
     fn user_event(&mut self, _el: &ActiveEventLoop, ev: UserEvent) {
-        let UserEvent::RepaintAt(t) = ev;
+        let t = match ev {
+            UserEvent::RepaintAt(t) => t,
+            UserEvent::Front => {
+                if let Some(g) = &self.gfx {
+                    g.window.set_minimized(false);
+                    g.window.focus_window();
+                    g.window.request_redraw();
+                }
+                return;
+            }
+        };
         if t <= Instant::now() {
             if let Some(g) = &self.gfx {
                 g.window.request_redraw();
@@ -182,44 +208,6 @@ fn window_icon() -> Option<winit::window::Icon> {
     winit::window::Icon::from_rgba(img.into_raw(), w, h).ok()
 }
 
-/// Journal de plantage : %APPDATA%\Vigie\crash.log
-fn install_crash_log() {
-    let default = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        if let Some(dir) = app::Settings::dir() {
-            let _ = std::fs::create_dir_all(&dir);
-            let bt = std::backtrace::Backtrace::force_capture();
-            let entry = format!("==== v{}\n{info}\n{bt}\n", env!("CARGO_PKG_VERSION"));
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("crash.log")) {
-                let _ = f.write_all(entry.as_bytes());
-            }
-        }
-        default(info);
-    }));
-}
-
-/// Une seule fenêtre : si Vigie tourne déjà, on la ramène au premier plan.
-fn already_running(after_elevate: bool) -> bool {
-    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
-    use windows_sys::Win32::System::Threading::CreateMutexW;
-    use windows_sys::Win32::UI::WindowsAndMessaging as wm;
-    unsafe {
-        let m = CreateMutexW(std::ptr::null(), 0, sys::wide("Local\\Vigie-instance").as_ptr());
-        if after_elevate || m.is_null() || GetLastError() != ERROR_ALREADY_EXISTS {
-            return false;
-        }
-        let h = wm::FindWindowW(std::ptr::null(), sys::wide("Vigie").as_ptr());
-        if !h.is_null() {
-            if wm::IsIconic(h) != 0 {
-                wm::ShowWindow(h, wm::SW_RESTORE);
-            }
-            wm::SetForegroundWindow(h);
-        }
-        true
-    }
-}
-
 /// `--avant-jeu` (sans fenêtre, pour le launcher) : chasse les fantômes sûrs, vide la veille (si admin),
 /// passe en Performances élevées. Résumé sur la sortie standard et dans %APPDATA%\Vigie\dernier-jeu.txt.
 fn headless_game(enter: bool, json: bool) -> i32 {
@@ -240,7 +228,7 @@ fn headless_game(enter: bool, json: bool) -> i32 {
             a.tick();
         }
         a.run_game_mode();
-        (a.toast.as_ref().map(|t| t.0.clone()).unwrap_or_default(), a.game_freed, 0)
+        (a.last_toast().unwrap_or_default(), a.game_freed, 0)
     } else {
         // léger : ni egui ni thread de mesure
         let mut s = app::Settings::load();
@@ -324,7 +312,7 @@ fn capture_offscreen(path: &str) -> i32 {
 }
 
 fn main() {
-    install_crash_log();
+    socle::crash::install("Vigie", env!("CARGO_PKG_VERSION"));
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(i) = args.iter().position(|a| a == "--set-taskmgr") {
         let on = args.get(i + 1).map(|v| v == "on").unwrap_or(false);
@@ -358,11 +346,26 @@ fn main() {
     if let Ok(path) = std::env::var("VIGIE_CAPTURE") {
         std::process::exit(capture_offscreen(&path));
     }
-    if already_running(after_elevate) {
-        return;
+    // Instance unique (socle : mutex + tube nommé) : une 2e instance ramène la fenêtre.
+    // Pas en test (règle n°0) ni juste après une élévation (l'ancienne instance se ferme).
+    let mut instance = None;
+    if socle::testmode::enabled() {
+        socle::testmode::low_priority();
+    } else if !after_elevate {
+        match socle::instance::start("Vigie", &args) {
+            socle::instance::Start::Forwarded => return,
+            socle::instance::Start::Primary(i) => instance = Some(i),
+            socle::instance::Start::Alone => {}
+        }
     }
     let event_loop = EventLoop::<UserEvent>::with_user_event().build().expect("boucle d’événements");
     let proxy = event_loop.create_proxy();
+    if let Some(i) = instance {
+        let p = proxy.clone();
+        i.listen(move |_args| {
+            let _ = p.send_event(UserEvent::Front);
+        });
+    }
     let ctx = egui::Context::default();
     ctx.set_request_repaint_callback(move |info| {
         let _ = proxy.send_event(UserEvent::RepaintAt(Instant::now() + info.delay));

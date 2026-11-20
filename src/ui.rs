@@ -1,11 +1,29 @@
 //! Dessin de l'interface (mêmes composants que l'Explorateur : barre d'outils, volet latéral,
 //! liste virtualisée, barre d'état, palette, fenêtres modales).
-use crate::app::{human_bytes, human_rate, pct, Action, App, Col, Confirm, Hist, Palette2, View};
+use crate::app::{human_bytes, human_rate, pct, Action, App, Col, Confirm, Hist, View};
 use crate::hunter::{self, Fix, Kind};
 use crate::sampler::{Key, Proc};
 use crate::sys::{self, Prio};
 use egui::{pos2, vec2, Align, Align2, Color32, CornerRadius, FontId, Frame, Layout, Margin, Rect, RichText, Sense, Stroke, Ui};
+use socle::icons::{self, Icon, Look};
+use socle::ui::Command;
 use std::sync::Arc;
+
+/// Petite icône vectorielle dans un rectangle (couleur du thème).
+fn ico(ui: &Ui, center: egui::Pos2, size: f32, icon: Icon, c: Color32) {
+    icons::paint(ui.painter(), Rect::from_center_size(center, vec2(size, size)), icon, c);
+}
+
+/// Libellé précédé d'une icône (remplace les emoji dans les labels).
+fn icon_label(ui: &mut Ui, icon: Icon, text: impl Into<String>, size: f32, color: Color32) -> egui::Response {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        let (r, _) = ui.allocate_exact_size(vec2(size + 2.0, size + 2.0), Sense::hover());
+        icons::paint(ui.painter(), r, icon, color);
+        ui.label(RichText::new(text.into()).size(size).color(color))
+    })
+    .inner
+}
 
 const ROW_H: f32 = 28.0;
 
@@ -27,7 +45,7 @@ fn text_right(ui: &Ui, rect: Rect, right: f32, text: &str, font: FontId, color: 
     ui.painter().text(pos2(right, rect.center().y), Align2::RIGHT_CENTER, text, font, color);
 }
 
-fn section(ui: &mut Ui, p: &crate::theme::Palette, t: &str) {
+fn section(ui: &mut Ui, p: &socle::theme::Palette, t: &str) {
     ui.add_space(6.0);
     ui.label(RichText::new(t.to_uppercase()).size(11.0).color(p.muted).strong());
     ui.add_space(2.0);
@@ -115,56 +133,50 @@ impl App {
         let ghost_ram: u64 = self.ghosts.iter().map(|g| g.ram).sum();
         egui::Panel::top("toolbar").frame(Frame::new().fill(p.chrome).inner_margin(Margin::symmetric(12, 8))).show(ui, |ui| {
             ui.horizontal(|ui| {
-                // vues, en contrôle segmenté
-                Frame::new().fill(p.soft).corner_radius(CornerRadius::same(9)).inner_margin(Margin::same(3)).show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.x = 2.0;
-                    let mut seg = |ui: &mut Ui, v: View, text: String, tip: &str| {
-                        let on = self.s.view == v;
-                        let fill = if on { if p.dark { Color32::from_rgb(0x2B, 0x44, 0x70) } else { p.surface } } else { Color32::TRANSPARENT };
-                        let color = if on { p.text } else { p.muted };
-                        if ui.add(egui::Button::new(RichText::new(text).color(color).strong()).fill(fill).min_size(vec2(0.0, 28.0))).on_hover_text(tip).clicked() {
-                            self.s.view = v;
-                        }
-                    };
-                    seg(ui, View::Procs, "☰  Processus".into(), "Liste des processus (Ctrl+Maj+P)");
-                    let hunt = if self.ghosts.is_empty() { "👻  Chasseur".to_string() } else { format!("👻  Chasseur · {}", human_bytes(ghost_ram)) };
-                    seg(ui, View::Hunter, hunt, "RAM fantôme récupérable (Ctrl+Maj+F)");
-                    seg(ui, View::Perf, "📈  Performances".into(), "Graphiques d’historique (Ctrl+Maj+G)");
-                    seg(ui, View::Startup, "⏻  Démarrage".into(), "Apps lancées avec Windows (Ctrl+Maj+D)");
-                });
+                // vues, en contrôle segmenté (socle)
+                let hunt = if self.ghosts.is_empty() { "Chasseur".to_string() } else { format!("Chasseur · {}", human_bytes(ghost_ram)) };
+                let views = [View::Procs, View::Hunter, View::Perf, View::Startup];
+                let mut cur = views.iter().position(|v| *v == self.s.view).unwrap_or(0);
+                if socle::ui::segmented(
+                    ui,
+                    &p,
+                    &mut cur,
+                    &[(Some(Icon::ListView), "Processus"), (Some(Icon::Ghost), hunt.as_str()), (Some(Icon::Chart), "Performances"), (Some(Icon::Power), "Démarrage")],
+                ) {
+                    self.s.view = views[cur];
+                }
                 if self.s.view == View::Procs {
                     ui.add_space(6.0);
                     self.draw_search(ui);
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let theme_icon = if self.s.dark { "☀" } else { "🌙" };
-                    if ui.add(egui::Button::new(theme_icon).min_size(vec2(32.0, 32.0))).on_hover_text(if self.s.dark { "Thème clair" } else { "Thème sombre" }).clicked() {
+                    let theme_icon = if self.s.dark { Icon::Sun } else { Icon::Moon };
+                    if icons::button(ui, theme_icon, 32.0, Look::tool(&p), if self.s.dark { "Thème clair" } else { "Thème sombre" }).clicked() {
                         let d = !self.s.dark;
                         self.set_dark(d);
                     }
                     self.draw_more_menu(ui);
                     if self.game_active {
-                        if ui
-                            .add(egui::Button::new(RichText::new("🎮  Mode jeu actif · Quitter").color(p.on_accent).strong()).fill(p.live).min_size(vec2(0.0, 32.0)))
-                            .on_hover_text("Restaure le plan d’alimentation précédent")
+                        if icons::wide(ui, Icon::Gamepad, "Mode jeu actif · Quitter", "", 210.0, Some((p.live, p.on_accent)), &p)
+                            .on_hover_text("Restaure le plan d’alimentation et réveille les apps mises en veille")
                             .clicked()
                         {
                             self.actions.push(Action::GameExit);
                         }
-                    } else if ui
-                        .add(egui::Button::new(RichText::new("🎮  Avant de jouer").color(p.on_accent).strong()).fill(p.accent).min_size(vec2(0.0, 32.0)))
-                        .on_hover_text("Chasse les fantômes sûrs, vide la mémoire en veille, plan Performances élevées (Ctrl+G)")
+                    } else if icons::wide(ui, Icon::Gamepad, "Avant de jouer", "", 158.0, Some((p.accent, p.on_accent)), &p)
+                        .on_hover_text("Chasse les fantômes sûrs, met en veille les apps en fond, plan Performances élevées (Ctrl+G)")
                         .clicked()
                     {
                         self.actions.push(Action::GameMode);
                     }
                     if self.s.view == View::Procs {
                         let tree = self.s.tree;
-                        if ui.add(egui::Button::new("☰").selected(!tree).min_size(vec2(32.0, 32.0))).on_hover_text("Liste à plat (Ctrl+T)").clicked() {
+                        let look = |on: bool| if on { Look::active(&p) } else { Look::tool(&p) };
+                        if icons::button(ui, Icon::ListView, 32.0, look(!tree), "Liste à plat (Ctrl+T)").clicked() {
                             self.s.tree = false;
                             self.rows_dirty = true;
                         }
-                        if ui.add(egui::Button::new("🌳").selected(tree).min_size(vec2(32.0, 32.0))).on_hover_text("Arbre parent / enfants (Ctrl+T)").clicked() {
+                        if icons::button(ui, Icon::Tree, 32.0, look(tree), "Arbre parent / enfants (Ctrl+T)").clicked() {
                             self.s.tree = true;
                             self.rows_dirty = true;
                         }
@@ -176,64 +188,49 @@ impl App {
 
     fn draw_search(&mut self, ui: &mut Ui) {
         let p = self.pal;
-        let edit = Frame::new()
-            .fill(p.code)
-            .stroke(Stroke::new(1.0, p.border))
-            .corner_radius(CornerRadius::same(8))
-            .inner_margin(Margin::symmetric(8, 6))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("🔍").color(p.muted));
-                    let r = ui.add(
-                        egui::TextEdit::singleline(&mut self.filter)
-                            .id(egui::Id::new("search"))
-                            .hint_text("Rechercher — nom, PID, :port (Ctrl+F)")
-                            .frame(Frame::NONE)
-                            .desired_width(250.0),
-                    );
-                    if !self.filter.is_empty() && ui.add(egui::Button::new(RichText::new("×").color(p.muted)).frame(false)).clicked() {
-                        self.filter.clear();
-                        self.rows_dirty = true;
-                    }
-                    r
-                })
-                .inner
-            })
-            .inner;
+        let id = egui::Id::new("search");
         if self.focus_search {
-            edit.request_focus();
+            ui.memory_mut(|m| m.request_focus(id));
             self.focus_search = false;
         }
-        if edit.changed() {
+        let before = self.filter.clone();
+        // Autocomplétion floue (socle) : historique + noms, descriptions et ports en cours
+        let r = socle::ui::autocomplete_field(ui, &p, id, &mut self.search_field, &self.search_ac, &mut self.filter, "Rechercher — nom, PID, :port (Ctrl+F)", 280.0);
+        if self.filter != before {
             self.rows_dirty = true;
         }
-        if edit.has_focus() {
-            let (enter, down, esc) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::ArrowDown), i.key_pressed(egui::Key::Escape)));
-            if enter || down {
-                edit.surrender_focus();
-                self.move_cursor(0, false);
-                if let Some(snap) = &self.snap {
-                    if let Some(r) = self.rows.first() {
-                        let k = snap.procs[r.idx].key;
-                        self.cursor = Some(k);
-                        self.selected = [k].into_iter().collect();
-                    }
+        if let Some(t) = &r.submitted {
+            if !t.trim().is_empty() {
+                self.search_ac.history.record(t.trim());
+                self.s.search_history = self.search_ac.history.clone();
+            }
+            // Entrée : on passe à la liste, sur le premier résultat
+            r.response.surrender_focus();
+            self.rebuild_rows();
+            if let Some(snap) = &self.snap {
+                if let Some(row) = self.rows.first() {
+                    let k = snap.procs[row.idx].key;
+                    self.cursor = Some(k);
+                    self.anchor = Some(k);
+                    self.selected = [k].into_iter().collect();
+                    self.scroll_to_cursor = true;
                 }
             }
-            if esc {
-                self.filter.clear();
-                self.rows_dirty = true;
-                edit.surrender_focus();
-            }
+        }
+        if r.response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.filter.clear();
+            self.rows_dirty = true;
+            r.response.surrender_focus();
         }
     }
 
     fn draw_more_menu(&mut self, ui: &mut Ui) {
         let p = self.pal;
-        ui.menu_button(RichText::new("⋯").size(16.0), |ui| {
+        let more = icons::button(ui, Icon::More, 32.0, Look::tool(&p), "Plus d’options");
+        egui::Popup::menu(&more).show(|ui| {
             ui.set_min_width(300.0);
             if ui.button("Palette de commandes…   Ctrl+K").clicked() {
-                self.palette = Some(Palette2 { query: String::new(), sel: 0, just_opened: true });
+                self.palette.open();
                 ui.close();
             }
             ui.separator();
@@ -276,7 +273,7 @@ impl App {
             {
                 self.actions.push(Action::TaskmgrToggle);
             }
-            if !self.elevated && ui.button("🛡  Relancer en administrateur").on_hover_text("Voir et gérer tous les processus, vider la mémoire en veille").clicked() {
+            if !self.elevated && ui.button("Relancer en administrateur").on_hover_text("Voir et gérer tous les processus, vider la mémoire en veille").clicked() {
                 self.actions.push(Action::Elevate);
                 ui.close();
             }
@@ -342,7 +339,8 @@ impl App {
                 } else {
                     (format!("{} récupérables", human_bytes(total)), format!("{} fantôme(s) · {} sûr(s)", self.ghosts.len(), self.ghosts.iter().filter(|g| g.safe).count()), p.live)
                 };
-                ui.painter().text(pos2(rect.left() + 10.0, rect.top() + 16.0), Align2::LEFT_CENTER, format!("👻 {big}"), FontId::proportional(13.5), c);
+                ico(ui, pos2(rect.left() + 18.0, rect.top() + 16.0), 16.0, Icon::Ghost, c);
+                ui.painter().text(pos2(rect.left() + 32.0, rect.top() + 16.0), Align2::LEFT_CENTER, big, FontId::proportional(13.5), c);
                 ui.painter().text(pos2(rect.left() + 10.0, rect.top() + 36.0), Align2::LEFT_CENTER, small, FontId::proportional(11.5), p.muted);
                 if r.clicked() {
                     self.s.view = View::Hunter;
@@ -358,9 +356,8 @@ impl App {
                 );
                 ui.label(RichText::new(txt).size(11.5).color(p.muted));
                 if self.elevated {
-                    ui.label(RichText::new("🛡 administrateur").size(11.5).color(p.add));
-                } else if ui
-                    .add(egui::Button::new(RichText::new("🛡 Relancer en admin").size(12.0)))
+                    icon_label(ui, Icon::Shield, "administrateur", 11.5, p.add);
+                } else if icons::wide(ui, Icon::Shield, "Relancer en admin", "", 170.0, None, &p)
                     .on_hover_text("Sans admin : mémoire en veille, services et processus protégés inaccessibles")
                     .clicked()
                 {
@@ -394,16 +391,14 @@ impl App {
                     }
                     ui.label(RichText::new(txt).color(p.muted).size(12.0));
                 }
-                if let Some((msg, _, err)) = &self.toast {
-                    ui.label(RichText::new(msg).color(if *err { p.del } else { p.text }).size(12.0));
-                }
+                self.toasts.ui(ui, &p);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if let Some(snap) = &self.snap {
                         ui.label(RichText::new(format!("mesure {:.1} ms · image {:.0} ms", snap.cost_ms, self.last_frame_ms)).color(p.muted).size(12.0))
                             .on_hover_text(format!("Coût d’une mesure (thread d’arrière-plan) et d’une image d’interface\n{}", snap.parts));
                     }
                     if self.freeze {
-                        ui.label(RichText::new("⏸ ordre figé").color(p.live).size(12.0)).on_hover_text("Tant que la souris est sur la liste, les lignes ne changent pas de place");
+                        icon_label(ui, Icon::Pause, "ordre figé", 12.0, p.live).on_hover_text("Tant que la souris est sur la liste, les lignes ne changent pas de place");
                     }
                 });
             });
@@ -414,13 +409,20 @@ impl App {
     fn sort_header(&mut self, ui: &mut Ui, rect: Rect, col: Col, right: bool) {
         let p = self.pal;
         let r = ui.interact(rect, ui.id().with(("hdr", col.label())), Sense::click());
-        let arrow = if self.s.sort == col { if self.s.asc { " ▲" } else { " ▼" } } else { "" };
-        let txt = format!("{}{arrow}", col.label().to_uppercase());
+        let txt = col.label().to_uppercase();
         let color = if r.hovered() || self.s.sort == col { p.text } else { p.muted };
+        let chevron = (self.s.sort == col).then(|| if self.s.asc { Icon::ChevronUp } else { Icon::ChevronDown });
         if right {
-            text_right(ui, rect, rect.right() - 6.0, &txt, FontId::proportional(11.0), color);
+            let x = rect.right() - 6.0 - if chevron.is_some() { 14.0 } else { 0.0 };
+            text_right(ui, rect, x, &txt, FontId::proportional(11.0), color);
+            if let Some(ch) = chevron {
+                ico(ui, pos2(rect.right() - 11.0, rect.center().y), 11.0, ch, color);
+            }
         } else {
-            text_left(ui, rect, rect.left(), &txt, FontId::proportional(11.0), color, rect.width());
+            let w = text_left(ui, rect, rect.left(), &txt, FontId::proportional(11.0), color, rect.width() - 16.0);
+            if let Some(ch) = chevron {
+                ico(ui, pos2(rect.left() + w + 9.0, rect.center().y), 11.0, ch, color);
+            }
         }
         if r.clicked() {
             if self.s.sort == col {
@@ -503,7 +505,7 @@ impl App {
             }
         }
         // ordre figé tant que la souris survole la liste
-        let hovering = ui.rect_contains_pointer(list_rect) && !self.palette.is_some();
+        let hovering = ui.rect_contains_pointer(list_rect) && !self.palette.is_open();
         if hovering != self.freeze {
             self.freeze = hovering;
             if !hovering {
@@ -546,7 +548,7 @@ impl App {
                         let ar = Rect::from_center_size(pos2(xn + 7.0, rect.center().y), vec2(18.0, 22.0));
                         let ar_r = ui.interact(ar, ui.id().with(("tw", pr.key)), Sense::click());
                         let c = if ar_r.hovered() { p.text } else { p.muted };
-                        ui.painter().text(ar.center(), Align2::CENTER_CENTER, if row.open { "▾" } else { "▸" }, FontId::proportional(13.0), c);
+                        ico(ui, ar.center(), 13.0, if row.open { Icon::ChevronDown } else { Icon::ChevronRight }, c);
                         if ar_r.clicked() {
                             toggle = Some(pr.key);
                         }
@@ -567,8 +569,8 @@ impl App {
                     }
                 }
                 if !drew {
-                    let (g, c) = if pr.session == 0 || pr.key.pid <= 4 { ("⚙", p.muted) } else { ("▫", p.muted) };
-                    ui.painter().text(ic.center(), Align2::CENTER_CENTER, g, FontId::proportional(13.0), c);
+                    let g = if pr.session == 0 || pr.key.pid <= 4 { Icon::Settings } else { Icon::File };
+                    icons::paint(ui.painter(), ic.shrink(1.0), g, p.muted);
                 }
                 xn += 24.0;
                 // nom : description lisible, puis l'exe en gris
@@ -610,20 +612,25 @@ impl App {
                             text_left(ui, rect, x0 + 14.0, &s.join(" "), FontId::monospace(11.5), p.accent, x1 - x0 - 16.0);
                         }
                         Col::Status => {
-                            let (s, c) = if pr.suspended {
-                                ("⏸ Suspendu", p.del)
+                            let (s, c, icon) = if pr.suspended {
+                                ("Suspendu", p.del, Some(Icon::Pause))
                             } else if ghosts.contains_key(&pr.key) {
-                                ("👻 Fantôme", p.live)
+                                ("Fantôme", p.live, Some(Icon::Ghost))
                             } else if pr.window.is_some() {
-                                ("App", p.text)
+                                ("App", p.text, None)
                             } else if pr.session == 0 || pr.key.pid <= 4 {
-                                ("Système", p.muted)
+                                ("Système", p.muted, None)
                             } else {
-                                ("Fond", p.muted)
+                                ("Fond", p.muted, None)
                             };
                             let prio = Prio::from_base(pr.base_prio);
                             let s = if prio != Prio::Normal && pr.key.pid > 4 { format!("{s} · {}", prio.short()) } else { s.to_string() };
-                            text_left(ui, rect, x0 + 6.0, &s, FontId::proportional(12.0), c, x1 - x0 - 8.0);
+                            let mut x = x0 + 6.0;
+                            if let Some(ic) = icon {
+                                ico(ui, pos2(x + 6.0, rect.center().y), 12.0, ic, c);
+                                x += 16.0;
+                            }
+                            text_left(ui, rect, x, &s, FontId::proportional(12.0), c, x1 - x - 2.0);
                         }
                         Col::Name => {}
                     }
@@ -635,7 +642,7 @@ impl App {
                         ui.label(format!("Fenêtre : {w}"));
                     }
                     if let Some(g) = ghosts.get(&pr.key) {
-                        ui.label(RichText::new(format!("👻 {g}")).color(p.live));
+                        icon_label(ui, Icon::Ghost, g.as_str(), 12.5, p.live);
                     }
                     if let Some(path) = &pr.path {
                         ui.label(RichText::new(&**path).color(p.muted).size(11.5));
@@ -807,7 +814,7 @@ impl App {
                 ui.add_space(4.0);
                 Frame::new().fill(p.live_bg).corner_radius(CornerRadius::same(8)).inner_margin(Margin::same(8)).show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    ui.label(RichText::new(format!("👻 {} — {}", g.kind.label(), g.reason)).color(p.live).size(12.5));
+                    icon_label(ui, Icon::Ghost, format!("{} — {}", g.kind.label(), g.reason), 12.5, p.live);
                 });
             }
             ui.add_space(8.0);
@@ -825,7 +832,7 @@ impl App {
                 if ui.button(if pr.suspended { "Reprendre" } else { "Suspendre" }).clicked() {
                     acts.push(Action::Suspend(vec![pr.key], !pr.suspended));
                 }
-                if pr.path.is_some() && ui.button("📁").on_hover_text("Ouvrir l’emplacement (Ctrl+E)").clicked() {
+                if pr.path.is_some() && icons::button(ui, Icon::Folder, 28.0, Look::tool(&p), "Ouvrir l’emplacement (Ctrl+E)").clicked() {
                     acts.push(Action::OpenLocation(pr.key));
                 }
             });
@@ -920,7 +927,11 @@ impl App {
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
                             if self.ghosts.is_empty() {
-                                ui.label(RichText::new("Aucun fantôme 👻").size(26.0).strong().color(p.add));
+                                ui.horizontal(|ui| {
+                                    let (r, _) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::hover());
+                                    icons::paint(ui.painter(), r, Icon::Ghost, p.add);
+                                    ui.label(RichText::new("Aucun fantôme").size(26.0).strong().color(p.add));
+                                });
                                 ui.label(RichText::new("Rien ne tourne pour rien : pas de serveur de dev oublié, d’orphelin ni d’app cachée gourmande.").color(p.muted));
                             } else {
                                 ui.label(RichText::new(format!("{} récupérables", human_bytes(total))).size(28.0).strong().color(p.live));
@@ -934,12 +945,14 @@ impl App {
                             }
                         });
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.add(egui::Button::new(RichText::new("🎮  Avant de jouer").strong()).min_size(vec2(0.0, 38.0))).on_hover_text("Ctrl+G").clicked() {
+                            if icons::wide(ui, Icon::Gamepad, "Avant de jouer", "Ctrl+G", 200.0, None, &p).clicked() {
                                 acts.push(Action::GameMode);
                             }
-                            let label = format!("🧹  Nettoyer la sélection · {}", human_bytes(sel_ram));
+                            let label = format!("Nettoyer la sélection · {}", human_bytes(sel_ram));
+                            let w = 70.0 + label.chars().count() as f32 * 7.4;
                             if ui
-                                .add_enabled(!sel.is_empty(), egui::Button::new(RichText::new(label).color(p.on_accent).strong()).fill(p.accent).min_size(vec2(0.0, 38.0)))
+                                .add_enabled_ui(!sel.is_empty(), |ui| icons::wide(ui, Icon::Broom, &label, "", w, Some((p.accent, p.on_accent)), &p))
+                                .inner
                                 .on_hover_text("Termine chaque processus coché avec ses descendants")
                                 .clicked()
                             {
@@ -957,7 +970,9 @@ impl App {
                     let sum: u64 = list.iter().map(|g| g.ram).sum();
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("{}  {}", kind.icon(), kind.label().to_uppercase())).size(11.5).color(p.muted).strong());
+                        let (r, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
+                        icons::paint(ui.painter(), r, kind.icon(), p.muted);
+                        ui.label(RichText::new(kind.label().to_uppercase()).size(11.5).color(p.muted).strong());
                         ui.label(RichText::new(human_bytes(sum)).size(11.5).color(p.muted));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             let all = list.iter().all(|g| self.checked.get(&g.key).copied().unwrap_or(false));
@@ -977,7 +992,7 @@ impl App {
                         let cb = Rect::from_center_size(pos2(rect.left() + 20.0, rect.center().y), vec2(16.0, 16.0));
                         ui.painter().rect(cb, CornerRadius::same(4), if on { p.accent } else { p.code }, Stroke::new(1.0, if on { p.accent } else { p.border }), egui::StrokeKind::Inside);
                         if on {
-                            ui.painter().text(cb.center(), Align2::CENTER_CENTER, "✔", FontId::proportional(12.0), p.on_accent);
+                            icons::paint(ui.painter(), cb.shrink(2.0), Icon::Check, p.on_accent);
                         }
                         let mut x = rect.left() + 40.0;
                         if let Some(path) = self.proc(g.key).and_then(|pr| pr.path.clone()) {
@@ -1209,7 +1224,7 @@ impl App {
         let standby = self.snap.as_ref().and_then(|s| s.totals.standby);
         let mut go = false;
         let mut open = true;
-        egui::Window::new("🎮  Mode avant de jouer").open(&mut open).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(&ctx, |ui| {
+        egui::Window::new("Mode avant de jouer").open(&mut open).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(&ctx, |ui| {
             ui.set_width(440.0);
             ui.checkbox(&mut self.s.game_kill, format!("Chasser les fantômes sûrs — {} processus, {}", safe.len(), human_bytes(safe_ram)));
             if !safe.is_empty() {
@@ -1288,9 +1303,9 @@ impl App {
         egui::Window::new("Raccourcis clavier").open(&mut open).collapsible(false).resizable(false).show(&ctx, |ui| {
             egui::Grid::new("keys").num_columns(2).spacing(vec2(24.0, 4.0)).show(ui, |ui| {
                 for (k, v) in [
-                    ("Ctrl+K / Ctrl+P", "Palette de commandes"),
-                    ("Ctrl+F ou taper", "Rechercher (nom, PID, :port, ligne de commande)"),
-                    ("Ctrl+Maj+P / F / G / D", "Processus / Chasseur (fantômes) / Graphiques / Démarrage"),
+                    ("Ctrl+K (ou Ctrl+P)", "Palette de commandes"),
+                    ("Ctrl+F ou taper", "Rechercher, floue (nom, PID, :port…) ; Tab complète, ↓ suggestions"),
+                    ("Ctrl+1 / 2 / 3 / 4", "Processus / Chasseur / Performances / Démarrage (aussi Ctrl+Maj+P / F / G / D)"),
                     ("↑ ↓ PgPréc PgSuiv Début Fin", "Naviguer (Maj : étendre la sélection)"),
                     ("← →", "Replier / déplier (arbre)"),
                     ("Ctrl+T", "Arbre / liste à plat"),
@@ -1316,139 +1331,135 @@ impl App {
         }
     }
 
-    /// Palette de commandes : actions + aller à un processus.
-    fn draw_palette(&mut self, ui: &mut Ui) {
-        if self.palette.is_none() {
-            return;
-        }
-        let p = self.pal;
-        let ctx = ui.ctx().clone();
-        type Item = (String, String, Vec<Action>);
-        let mut items: Vec<Item> = Vec::new();
-        let cmd = |label: &str, key: &str, a: Vec<Action>| (label.to_string(), key.to_string(), a);
-        let mut base: Vec<Item> = vec![
-            cmd("Mode avant de jouer", "Ctrl+G", vec![Action::GameMode]),
-            cmd("Nettoyer les fantômes sûrs", "", vec![Action::Clean(self.safe_ghosts().iter().map(|g| g.key).collect())]),
-            cmd("Vue Processus", "Ctrl+Maj+P", vec![Action::SetView(View::Procs)]),
-            cmd("Vue Chasseur de RAM", "Ctrl+Maj+F", vec![Action::SetView(View::Hunter)]),
-            cmd("Vue Performances", "Ctrl+Maj+G", vec![Action::SetView(View::Perf)]),
-            cmd("Vue Démarrage", "Ctrl+Maj+D", vec![Action::SetView(View::Startup)]),
-            cmd("Mettre en veille les apps en arrière-plan", "", vec![Action::Trim(self.trim_candidates())]),
-            cmd("Mesurer maintenant", "F5", vec![Action::SampleNow]),
-            cmd(if self.taskmgr { "Rendre Ctrl+Maj+Échap au Gestionnaire Windows" } else { "Remplacer le Gestionnaire des tâches" }, "", vec![Action::TaskmgrToggle]),
+    /// Commandes de la palette Ctrl+K (construites seulement quand elle est ouverte).
+    /// L'id encode l'action : `view:hunter`, `goto:1234:133…`, `killname:node.exe`…
+    fn palette_commands(&self) -> Vec<Command> {
+        let mut v = vec![
+            Command::new("game", "Mode avant de jouer").group("Jeu").keys("Ctrl+G").icon(Icon::Gamepad),
+            Command::new("clean_safe", "Nettoyer les fantômes sûrs").group("Chasseur").icon(Icon::Broom).enabled(!self.safe_ghosts().is_empty()),
+            Command::new("trim_bg", "Mettre en veille les apps en arrière-plan").group("Mémoire").icon(Icon::Sleep),
+            Command::new("view:procs", "Vue Processus").group("Vue").keys("Ctrl+1").icon(Icon::ListView),
+            Command::new("view:hunter", "Vue Chasseur de RAM").group("Vue").keys("Ctrl+2").icon(Icon::Ghost),
+            Command::new("view:perf", "Vue Performances").group("Vue").keys("Ctrl+3").icon(Icon::Chart),
+            Command::new("view:startup", "Vue Démarrage").group("Vue").keys("Ctrl+4").icon(Icon::Power),
+            Command::new("tree", "Arbre / liste à plat").group("Vue").keys("Ctrl+T").icon(Icon::Tree),
+            Command::new("theme", if self.s.dark { "Thème clair" } else { "Thème sombre" }).group("Vue").icon(if self.s.dark { Icon::Sun } else { Icon::Moon }),
+            Command::new("sample", "Mesurer maintenant").group("Système").keys("F5").icon(Icon::Refresh),
+            Command::new("taskmgr", if self.taskmgr { "Rendre Ctrl+Maj+Échap au Gestionnaire Windows" } else { "Remplacer le Gestionnaire des tâches" }).group("Système").icon(Icon::Settings),
+            Command::new("help", "Raccourcis clavier").group("Aide").keys("F1").icon(Icon::Keyboard),
         ];
         if self.game_active {
-            base.insert(0, cmd("Quitter le mode jeu", "", vec![Action::GameExit]));
+            v.insert(0, Command::new("game_exit", "Quitter le mode jeu").group("Jeu").icon(Icon::Gamepad));
         }
         if !self.elevated {
-            base.push(cmd("Relancer en administrateur", "", vec![Action::Elevate]));
+            v.push(Command::new("elevate", "Relancer en administrateur").group("Système").icon(Icon::Shield));
         }
-        let pal = self.palette.as_mut().unwrap();
-        let q = pal.query.trim().to_lowercase();
-        for it in base {
-            if q.is_empty() || it.0.to_lowercase().contains(&q) {
-                items.push(it);
-            }
-        }
+        // processus correspondant à la saisie : « Aller à » et « Terminer tous les … »
+        let q = self.palette.query().trim().to_lowercase();
         if let Some(snap) = &self.snap {
-            if !q.is_empty() {
-                let mut ps: Vec<&Proc> = snap.procs.iter().filter(|x| x.name.to_lowercase().contains(&q) || x.key.pid.to_string() == q).collect();
+            if q.len() >= 2 && !q.starts_with(':') {
+                let mut ps: Vec<&Proc> = snap.procs.iter().filter(|x| socle::fuzzy::score(&x.name, &q).is_some() || x.key.pid.to_string() == q).collect();
                 ps.sort_by(|a, b| b.mem.cmp(&a.mem));
-                for pr in ps.into_iter().take(6) {
-                    items.push((format!("Aller à {} ({}) · {}", pr.name, pr.key.pid, human_bytes(pr.mem)), "".into(), vec![Action::Select(pr.key)]));
+                for pr in ps.iter().take(6) {
+                    v.push(
+                        Command::new(format!("goto:{}:{}", pr.key.pid, pr.key.ctime), format!("Aller à {} ({}) · {}", pr.name, pr.key.pid, human_bytes(pr.mem)))
+                            .group("Processus")
+                            .icon(Icon::ArrowRight),
+                    );
                 }
-                // « Terminer node » : tous les processus de ce nom
-                let same: Vec<Key> = snap.procs.iter().filter(|x| x.name.to_lowercase().trim_end_matches(".exe") == q.trim_end_matches(".exe")).map(|x| x.key).collect();
-                if !same.is_empty() {
-                    items.push((format!("Terminer tous les « {} » ({})", q, same.len()), "".into(), vec![Action::Kill(same, true)]));
+                let mut names: Vec<&str> = ps.iter().map(|p| &*p.name).collect();
+                names.sort();
+                names.dedup();
+                for n in names.into_iter().take(2) {
+                    let count = snap.procs.iter().filter(|x| &*x.name == n).count();
+                    v.push(Command::new(format!("killname:{n}"), format!("Terminer tous les « {n} » ({count})")).group("Processus").icon(Icon::Close));
                 }
             }
         }
-        if pal.sel >= items.len() {
-            pal.sel = items.len().saturating_sub(1);
-        }
-        let (up, down, enter, esc) = ctx.input_mut(|i| {
-            use egui::{Key, Modifiers as M};
-            (i.consume_key(M::NONE, Key::ArrowUp), i.consume_key(M::NONE, Key::ArrowDown), i.consume_key(M::NONE, Key::Enter), i.consume_key(M::NONE, Key::Escape))
-        });
-        if up {
-            pal.sel = pal.sel.saturating_sub(1);
-        }
-        if down && pal.sel + 1 < items.len() {
-            pal.sel += 1;
-        }
-        let mut close = esc;
-        let mut run: Option<usize> = if enter && !items.is_empty() { Some(pal.sel) } else { None };
-        let screen = ctx.content_rect();
-        let w = 600.0_f32.min(screen.width() - 32.0);
-        let backdrop = egui::Area::new(egui::Id::new("pal_backdrop")).order(egui::Order::Foreground).fixed_pos(screen.min).show(&ctx, |ui| {
-            let (r, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
-            ui.painter().rect_filled(r, CornerRadius::ZERO, Color32::from_black_alpha(90));
-            resp.clicked()
-        });
-        if backdrop.inner {
-            close = true;
-        }
-        egui::Area::new(egui::Id::new("palette")).order(egui::Order::Tooltip).fixed_pos(pos2(screen.center().x - w / 2.0, screen.top() + 90.0)).show(&ctx, |ui| {
-            Frame::new()
-                .fill(p.surface)
-                .stroke(Stroke::new(1.0, p.border))
-                .corner_radius(CornerRadius::same(12))
-                .inner_margin(Margin::same(10))
-                .shadow(egui::Shadow { offset: [0, 12], blur: 40, spread: 0, color: Color32::from_black_alpha(70) })
-                .show(ui, |ui| {
-                    ui.set_width(w);
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("›").color(p.accent).size(18.0));
-                        let r = ui.add(
-                            egui::TextEdit::singleline(&mut pal.query)
-                                .hint_text("Commande ou processus… (« node », « jeu », « admin »)")
-                                .frame(Frame::NONE)
-                                .font(FontId::proportional(17.0))
-                                .desired_width(f32::INFINITY),
-                        );
-                        if pal.just_opened || !r.has_focus() {
-                            r.request_focus();
-                            pal.just_opened = false;
-                        }
-                        if r.changed() {
-                            pal.sel = 0;
-                        }
-                    });
-                    ui.separator();
-                    for (i, (label, key, _)) in items.iter().enumerate() {
-                        let (rect, r) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
-                        let bg = if i == pal.sel { p.sel_bg } else if r.hovered() { p.hover_bg } else { Color32::TRANSPARENT };
-                        ui.painter().rect_filled(rect, CornerRadius::same(6), bg);
-                        text_left(ui, rect, rect.left() + 10.0, label, FontId::proportional(14.0), p.text, rect.width() - 120.0);
-                        if !key.is_empty() {
-                            text_right(ui, rect, rect.right() - 10.0, key, FontId::monospace(12.0), p.muted);
-                        }
-                        if r.clicked() {
-                            run = Some(i);
-                        }
-                    }
-                    if items.is_empty() {
-                        ui.label(RichText::new("Aucun résultat").color(p.muted));
-                    }
-                });
-        });
-        if let Some(i) = run {
-            if let Some((_, _, acts)) = items.into_iter().nth(i) {
-                self.actions.extend(acts);
+        v
+    }
+
+    fn run_command(&mut self, id: &str) {
+        let a = match id {
+            "game" => Action::GameMode,
+            "game_exit" => Action::GameExit,
+            "clean_safe" => Action::Clean(self.safe_ghosts().iter().map(|g| g.key).collect()),
+            "trim_bg" => Action::Trim(self.trim_candidates()),
+            "view:procs" => Action::SetView(View::Procs),
+            "view:hunter" => Action::SetView(View::Hunter),
+            "view:perf" => Action::SetView(View::Perf),
+            "view:startup" => Action::SetView(View::Startup),
+            "tree" => {
+                self.s.tree = !self.s.tree;
+                self.rows_dirty = true;
+                return;
             }
-            close = true;
+            "theme" => {
+                let d = !self.s.dark;
+                self.set_dark(d);
+                return;
+            }
+            "sample" => Action::SampleNow,
+            "taskmgr" => Action::TaskmgrToggle,
+            "help" => {
+                self.help = true;
+                return;
+            }
+            "elevate" => Action::Elevate,
+            _ => {
+                if let Some(rest) = id.strip_prefix("goto:") {
+                    let mut it = rest.split(':');
+                    if let (Some(pid), Some(ct)) = (it.next().and_then(|x| x.parse().ok()), it.next().and_then(|x| x.parse().ok())) {
+                        self.actions.push(Action::Select(Key { pid, ctime: ct }));
+                    }
+                } else if let Some(n) = id.strip_prefix("killname:") {
+                    let keys: Vec<Key> = self.snap.as_ref().map(|s| s.procs.iter().filter(|x| &*x.name == n).map(|x| x.key).collect()).unwrap_or_default();
+                    self.actions.push(Action::Kill(keys, true));
+                }
+                return;
+            }
+        };
+        self.actions.push(a);
+    }
+
+    /// Palette de commandes Ctrl+K du socle (recherche floue, récents en tête).
+    fn draw_palette(&mut self, ui: &mut Ui) {
+        if !self.palette.is_open() {
+            return;
         }
-        if close {
-            self.palette = None;
+        let cmds = self.palette_commands();
+        let ctx = ui.ctx().clone();
+        let p = self.pal;
+        if let Some(id) = self.palette.show(&ctx, &p, &cmds) {
+            self.run_command(&id);
         }
     }
 
     // ---------- Clavier ----------
     pub fn handle_keys(&mut self, ctx: &egui::Context) {
         use egui::{Key, Modifiers as M};
-        if self.palette.is_some() || self.confirm.is_some() || self.game_dialog {
+        // Ctrl+K (socle) ; Ctrl+P reste un alias
+        if self.confirm.is_none() && !self.game_dialog {
+            // (Maj testée avant : consume ignore Maj et avalerait Ctrl+Maj+P)
+            let ctrl_p_sans_maj = ctx.input(|i| {
+                i.events.iter().any(|e| matches!(e, egui::Event::Key { key: Key::P, pressed: true, modifiers, .. } if modifiers.command && !modifiers.shift))
+            });
+            if !self.palette.handle_shortcut(ctx) && ctrl_p_sans_maj && socle::keys::consume(ctx, egui::Modifiers::COMMAND, Key::P) {
+                self.palette.open();
+            }
+        }
+        if self.palette.is_open() || self.confirm.is_some() || self.game_dialog {
             return;
+        }
+        // Ctrl+1…4 : touche physique (socle::keys), marche en AZERTY
+        if let Some(n) = socle::keys::consume_ctrl_digit(ctx) {
+            match n {
+                1 => self.s.view = View::Procs,
+                2 => self.s.view = View::Hunter,
+                3 => self.s.view = View::Perf,
+                4 => self.s.view = View::Startup,
+                _ => {}
+            }
         }
         let typing = ctx.memory(|m| m.focused().is_some()) && ctx.egui_wants_keyboard_input();
         let mut acts = Vec::new();
@@ -1459,9 +1470,6 @@ impl App {
                 if i.consume_key(M::COMMAND | M::SHIFT, k) {
                     self.s.view = v;
                 }
-            }
-            if i.consume_key(M::COMMAND, Key::K) || i.consume_key(M::COMMAND, Key::P) {
-                self.palette = Some(Palette2 { query: String::new(), sel: 0, just_opened: true });
             }
             if i.consume_key(M::COMMAND, Key::F) {
                 self.s.view = View::Procs;
@@ -1651,7 +1659,7 @@ impl App {
                         );
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button("⟳  Actualiser").clicked() {
+                        if icons::wide(ui, Icon::Refresh, "Actualiser", "", 130.0, None, &p).clicked() {
                             acts.push(Action::StartupRefresh);
                         }
                     });
@@ -1740,11 +1748,25 @@ mod tests {
             press(&ctx, &mut app, k, cs);
             assert_eq!(app.s.view, v, "Ctrl+Maj+{k:?}");
         }
-        assert!(app.palette.is_none(), "Ctrl+Maj+P ne doit pas ouvrir la palette");
+        assert!(!app.palette.is_open(), "Ctrl+Maj+P ne doit pas ouvrir la palette");
         // Ctrl+P seul : palette, pas de changement de vue
         app.s.view = View::Hunter;
         press(&ctx, &mut app, Key::P, Modifiers { ctrl: true, command: true, ..Default::default() });
-        assert!(app.palette.is_some());
+        assert!(app.palette.is_open());
+        assert_eq!(app.s.view, View::Hunter);
+    }
+
+    /// AZERTY : la touche 4 envoie « ' » (Key::Quote) avec la touche physique Num4.
+    #[test]
+    fn ctrl_chiffre_azerty() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, Settings::default());
+        let ctrl = Modifiers { ctrl: true, command: true, ..Default::default() };
+        let mut raw = RawInput::default();
+        raw.events.push(Event::Key { key: Key::Quote, physical_key: Some(Key::Num4), pressed: true, repeat: false, modifiers: ctrl });
+        let _ = ctx.run_ui(raw, |ui| app.handle_keys(ui.ctx()));
+        assert_eq!(app.s.view, View::Startup);
+        press(&ctx, &mut app, Key::Num2, ctrl);
         assert_eq!(app.s.view, View::Hunter);
     }
 }
