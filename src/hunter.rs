@@ -137,7 +137,8 @@ const PROTECTED: &[&str] = &[
 ];
 
 /// Processus Docker Desktop (hors VM)
-const DOCKER_PROCS: &[&str] = &["docker desktop.exe", "com.docker.backend.exe", "com.docker.build.exe", "com.docker.dev-envs.exe", "docker-sandbox.exe"];
+/// Processus de Docker Desktop (hors VM), partagés par le chasseur, `--etat-dev` et `--couper-dev`.
+pub const DOCKER_PROCS: &[&str] = &["docker desktop.exe", "com.docker.backend.exe", "com.docker.build.exe", "com.docker.dev-envs.exe", "docker-sandbox.exe"];
 
 /// Jamais touché par Vigie (chasse, mise en veille).
 pub fn is_protected_name(lower: &str) -> bool {
@@ -150,8 +151,18 @@ pub fn is_dev_tool(name: &str) -> bool {
 
 /// Le processus fait-il partie d'un agent IA / outil qu'il ne faut jamais tuer (Claude Code, etc.) ?
 fn is_ai_agent(p: &Proc) -> bool {
-    let cmd = p.cmd.as_deref().unwrap_or("").to_ascii_lowercase();
-    cmd.contains("@anthropic-ai") || cmd.contains("claude-code") || cmd.contains(r"\claude.exe") || cmd.contains("copilot-language-server") || cmd.contains("@openai/codex")
+    is_ai_cmd(p.cmd.as_deref().unwrap_or(""))
+}
+
+/// Agent IA ou outil d'éditeur qu'il ne faut jamais tuer ni endormir : Claude Code, Claude,
+/// Copilot, Codex. Même règle dans le chasseur, la sieste de projet et `--couper-dev`.
+pub fn is_ai_cmd(cmd: &str) -> bool {
+    let c = cmd.to_ascii_lowercase();
+    ["@anthropic-ai", "claude-code", r"\claude.exe", "copilot-language-server", "github.copilot", "@openai/codex", r"\codex.exe"].iter().any(|m| c.contains(m))
+}
+
+pub fn is_docker_name(lower: &str) -> bool {
+    DOCKER_PROCS.contains(&lower)
 }
 
 /// Règle de liste blanche qui couvre ce processus : `nom` ou `nom | fragment de ligne de commande`.
@@ -241,14 +252,7 @@ pub fn hunt(snap: &Snapshot, cx: &Context) -> Vec<Ghost> {
     }
     let lname = |p: &Proc| p.name.to_ascii_lowercase();
     // ancêtres de Vigie (ex. Claude Code qui l'a lancée) : intouchables
-    let mut protected: HashSet<Key> = HashSet::new();
-    if let Some(me) = snap.procs.iter().find(|p| p.key.pid == cx.self_pid) {
-        let mut cur = Some(me.key);
-        while let Some(k) = cur {
-            protected.insert(k);
-            cur = by_key.get(&k).and_then(|p| p.parent);
-        }
-    }
+    let protected: HashSet<Key> = crate::qol::self_and_ancestors(snap, cx.self_pid);
     let tree = |k: Key| -> Vec<Key> {
         let mut out = vec![k];
         let mut i = 0;
@@ -612,4 +616,117 @@ pub fn kill_order(procs: &[Proc], root: Key) -> Vec<Key> {
     }
     out.reverse();
     out
+}
+
+#[cfg(test)]
+mod tests {
+    //! Chasseur sur de faux instantanés (aucun processus réel touché).
+    use super::*;
+    use crate::sampler::{Proc, Snapshot, Totals};
+    use crate::sys::Port;
+    use std::sync::Arc;
+
+    const SESSION: u32 = 1;
+    const MOI: u32 = 9000;
+
+    fn proc(pid: u32, parent: Option<u32>, name: &str) -> Proc {
+        Proc {
+            key: Key { pid, ctime: pid as i64 * 10 },
+            ppid: parent.unwrap_or(0),
+            parent: parent.map(|pp| Key { pid: pp, ctime: pp as i64 * 10 }),
+            name: Arc::from(name),
+            path: None,
+            cmd: None,
+            session: SESSION,
+            threads: 4,
+            handles: 10,
+            base_prio: 8,
+            suspended: false,
+            cpu: 0.0,
+            mem: 300 << 20,
+            commit: 0,
+            ws: 300 << 20,
+            disk: 0.0,
+            gpu: 0.0,
+            gpu_mem: 0,
+            window: None,
+            ports: Arc::from(Vec::new()),
+            idle_secs: 3600.0,
+            age_secs: 7200.0,
+            idle_min: false,
+        }
+    }
+
+    fn snap(mut procs: Vec<Proc>) -> Snapshot {
+        // Vigie elle-même, lancée par un terminal
+        procs.push(proc(MOI - 1, None, "WindowsTerminal.exe"));
+        procs.push(proc(MOI, Some(MOI - 1), "vigie.exe"));
+        Snapshot { procs, totals: Totals::default(), cost_ms: 0.0, ncpu: 8, parts: String::new(), fullscreen: false }
+    }
+
+    fn chasse(s: &Snapshot) -> Vec<Ghost> {
+        hunt(s, &Context { session: SESSION, self_pid: MOI, whitelist: &[], docker: &[] })
+    }
+
+    fn port(p: u16) -> Arc<[Port]> {
+        Arc::from(vec![Port { tcp: true, port: p, local_only: true }])
+    }
+
+    #[test]
+    fn edge_sans_fenetre_inactif_est_sur() {
+        let g = chasse(&snap(vec![proc(100, None, "msedge.exe"), proc(101, Some(100), "msedge.exe")]));
+        let e = g.iter().find(|g| g.name == "msedge.exe").expect("Edge en fond doit être proposé");
+        assert_eq!(e.kind, Kind::Background);
+        assert!(e.safe);
+        assert_eq!(e.count, 2);
+    }
+
+    #[test]
+    fn edge_avec_fenetre_pas_propose() {
+        let mut fen = proc(101, Some(100), "msedge.exe");
+        fen.window = Some(Arc::from("YouTube — Edge"));
+        assert!(chasse(&snap(vec![proc(100, None, "msedge.exe"), fen])).iter().all(|g| g.name != "msedge.exe"));
+    }
+
+    #[test]
+    fn serveur_de_dev_orphelin_inactif() {
+        let mut n = proc(200, None, "node.exe");
+        n.ports = port(5173);
+        let g = chasse(&snap(vec![n]));
+        let s = g.iter().find(|g| g.kind == Kind::DevServer).expect("serveur oublié");
+        assert!(s.safe, "orphelin + inactif = sûr");
+    }
+
+    #[test]
+    fn agent_ia_jamais_propose() {
+        let mut n = proc(300, None, "node.exe");
+        n.ports = port(4000);
+        n.cmd = Some(Arc::from(r#"node C:\Users\x\AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\cli.js"#));
+        let mut c = proc(301, None, "node.exe");
+        c.cmd = Some(Arc::from("node copilot-language-server --stdio"));
+        assert!(chasse(&snap(vec![n, c])).is_empty());
+    }
+
+    #[test]
+    fn ancetre_de_vigie_jamais_propose() {
+        // un serveur de dev qui a lancé Vigie (ex. via npm run) : intouchable
+        let mut s = snap(vec![]);
+        let mut n = proc(400, None, "node.exe");
+        n.ports = port(3000);
+        s.procs.push(n);
+        for p in &mut s.procs {
+            if p.key.pid == MOI - 1 {
+                p.parent = Some(Key { pid: 400, ctime: 4000 });
+            }
+        }
+        assert!(chasse(&s).iter().all(|g| g.key.pid != 400));
+    }
+
+    #[test]
+    fn parent_protege_pas_propose_en_arbre() {
+        // un « lourd et inactif » dont l'arbre contient un processus protégé (explorer.exe) n'est pas proposé
+        let racine = proc(500, None, "outil.exe");
+        let enfant = proc(501, Some(500), "explorer.exe");
+        assert!(chasse(&snap(vec![racine, enfant])).iter().all(|g| g.key.pid != 500));
+    }
 }

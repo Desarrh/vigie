@@ -32,8 +32,6 @@ impl Source {
         matches!(self, Source::MachineRun | Source::MachineRun32 | Source::CommonFolder)
     }
     fn approved(self) -> (HKEY, &'static str) {
-        const BASE: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\";
-        let _ = BASE;
         match self {
             Source::UserRun => (HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"),
             Source::MachineRun => (HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"),
@@ -140,7 +138,7 @@ pub fn exe_of(cmd: &str) -> Option<String> {
     let path = if let Some(r) = c.strip_prefix('"') {
         r.split('"').next()?.to_string()
     } else {
-        let low = c.to_lowercase();
+        let low = c.to_ascii_lowercase(); // même longueur que `c` : le découpage reste valide
         match low.find(".exe") {
             Some(i) => c[..i + 4].to_string(),
             None => c.split(' ').next()?.to_string(),
@@ -159,7 +157,7 @@ pub fn list() -> Vec<Entry> {
         }
     }
     let folders = [
-        (Source::UserFolder, dirs::config_dir().map(|d| d.join(r"Microsoft\Windows\Start Menu\Programs\Startup"))),
+        (Source::UserFolder, crate::sys::appdata().map(|d| d.join(r"Microsoft\Windows\Start Menu\Programs\Startup"))),
         (Source::CommonFolder, std::env::var_os("ProgramData").map(|d| std::path::PathBuf::from(d).join(r"Microsoft\Windows\Start Menu\Programs\Startup"))),
     ];
     for (src, dir) in folders {
@@ -179,6 +177,31 @@ pub fn list() -> Vec<Entry> {
     }
     out.sort_by(|a, b| b.enabled.cmp(&a.enabled).then(a.name.to_lowercase().cmp(&b.name.to_lowercase())));
     out
+}
+
+/// RAM actuelle de chaque exe de démarrage : processus du même exe, ou exe du même nom sous le
+/// dossier du lanceur (Discord : `Discord\app-1.0\Discord.exe`). Calculée à la mesure.
+pub fn ram_table(list: &[Entry], procs: &[crate::sampler::Proc]) -> std::collections::HashMap<String, (u64, usize)> {
+    let paths: Vec<(String, u64)> = procs.iter().filter_map(|p| p.path.as_ref().map(|x| (x.to_lowercase(), p.mem))).collect();
+    let mut ram = std::collections::HashMap::new();
+    for e in list {
+        let Some(exe) = &e.exe else { continue };
+        let pe = std::path::Path::new(exe);
+        let dir = pe.parent().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
+        let file = pe.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+        let (pre, suf) = (format!("{dir}\\"), format!("\\{file}"));
+        let mut acc = (0u64, 0usize);
+        for (path, mem) in &paths {
+            if path == exe || (!dir.is_empty() && path.starts_with(&pre) && path.ends_with(&suf)) {
+                acc.0 += mem;
+                acc.1 += 1;
+            }
+        }
+        if acc.1 > 0 {
+            ram.insert(exe.clone(), acc);
+        }
+    }
+    ram
 }
 
 #[cfg(test)]

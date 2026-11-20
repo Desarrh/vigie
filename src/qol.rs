@@ -107,8 +107,10 @@ impl Project {
 
 /// `C:\Dev\x\…` (dans un chemin ou une ligne de commande) → (« x », « C:\Dev\x »).
 pub fn project_of(text: &str, root: &str) -> Option<(String, String)> {
-    let low = text.to_lowercase();
-    let r = root.trim_end_matches('\\').to_lowercase() + "\\";
+    // ASCII seulement : la position trouvée dans `low` doit rester valable dans `text`
+    // (to_lowercase peut changer la longueur en octets de certains caractères → panique au découpage)
+    let low = text.to_ascii_lowercase();
+    let r = root.trim_end_matches('\\').to_ascii_lowercase() + "\\";
     let i = low.find(&r)?;
     let rest = &text[i + r.len()..];
     let name: String = rest.chars().take_while(|c| !matches!(c, '\\' | '/' | '"' | ' ' | '\'')).collect();
@@ -128,8 +130,7 @@ pub fn projects(snap: &Snapshot, session: u32, root: &str, untouchable: &HashSet
             continue;
         }
         let cmd = p.cmd.as_deref().unwrap_or("");
-        let lc = cmd.to_ascii_lowercase();
-        if lc.contains("@anthropic-ai") || lc.contains("claude-code") {
+        if crate::hunter::is_ai_cmd(cmd) {
             continue;
         }
         let Some((name, dir)) = p.path.as_deref().and_then(|x| project_of(x, root)).or_else(|| project_of(cmd, root)) else { continue };
@@ -148,13 +149,20 @@ pub fn projects(snap: &Snapshot, session: u32, root: &str, untouchable: &HashSet
 /// Vigie et toute sa chaîne de parents (ne jamais endormir celui qui nous a lancés).
 pub fn self_and_ancestors(snap: &Snapshot, self_pid: u32) -> HashSet<Key> {
     let by: HashMap<Key, &Proc> = snap.procs.iter().map(|p| (p.key, p)).collect();
+    let start = snap.procs.iter().find(|p| p.key.pid == self_pid).map(|p| p.key);
+    ancestors(start, |k| by.get(&k).and_then(|p| p.parent))
+}
+
+/// `start` et toute sa chaîne de parents (règle « intouchables » partagée par le chasseur,
+/// la sieste de projet et `--couper-dev`).
+pub fn ancestors(start: Option<Key>, parent: impl Fn(Key) -> Option<Key>) -> HashSet<Key> {
     let mut out = HashSet::new();
-    let mut cur = snap.procs.iter().find(|p| p.key.pid == self_pid).map(|p| p.key);
+    let mut cur = start;
     while let Some(k) = cur {
         if !out.insert(k) {
             break;
         }
-        cur = by.get(&k).and_then(|p| p.parent);
+        cur = parent(k);
     }
     out
 }
@@ -306,6 +314,7 @@ mod sieste_tests {
     /// Endort puis réveille un faux projet (node jetable sous C:\Dev\vigie\target), sans toucher à rien d'autre.
     #[test]
     fn endormir_reveiller_projet() {
+        let _verrou = crate::TEST_PROCESSUS.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join("vigie-test-data");
         let _ = std::fs::create_dir_all(&dir);
         unsafe { std::env::set_var("VIGIE_DATA_DIR", &dir) };
@@ -333,7 +342,7 @@ mod sieste_tests {
         let suspended = |pid: u32| crate::sys::query_processes(&mut Vec::new()).into_iter().find(|r| r.pid == pid).map(|r| r.suspended).unwrap_or(false);
         app.actions.push(Action::SleepProject(dir.clone()));
         app.apply_actions();
-        assert!(suspended(pid), "node devrait être suspendu");
+        assert!(suspended(pid), "node devrait être suspendu — {:?}", app.last_toast());
         app.actions.push(Action::WakeProject(dir));
         app.apply_actions();
         assert!(!suspended(pid), "node devrait être réveillé");

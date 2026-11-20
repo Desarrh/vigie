@@ -36,7 +36,6 @@ pub struct Etat {
     pub ms: f32,
 }
 
-const DOCKER: &[&str] = &["docker desktop.exe", "com.docker.backend.exe", "com.docker.build.exe", "com.docker.dev-envs.exe", "docker-sandbox.exe"];
 const JAMAIS: &[&str] = &["ultimate.exe", "vigie.exe"];
 
 struct Vue {
@@ -48,12 +47,20 @@ struct Vue {
     fenetres: HashSet<u32>,
     /// Vigie et tous ses ancêtres (dont l'appelant, Ultimate)
     intouchables: HashSet<Key>,
+    /// ligne de commande d'un PID (réelle, ou fausse dans les tests)
+    cmd: Box<dyn Fn(u32) -> Option<String>>,
 }
 
 impl Vue {
     fn lire() -> Vue {
         let mut buf = Vec::new();
         let raws = sys::query_processes(&mut buf);
+        let fenetres = sys::windows().into_keys().collect();
+        Vue::assembler(raws, sys::ports(), fenetres, std::process::id(), Box::new(sys::process_cmdline))
+    }
+
+    /// Vue à partir de données fournies (réelles, ou fausses dans les tests).
+    fn assembler(raws: Vec<Raw>, ports: HashMap<u32, Vec<Port>>, fenetres: HashSet<u32>, moi: u32, cmd: Box<dyn Fn(u32) -> Option<String>>) -> Vue {
         let keys: HashMap<u32, Key> = raws.iter().map(|r| (r.pid, Key { pid: r.pid, ctime: r.create_time })).collect();
         let mut parent = HashMap::new();
         let mut kids: HashMap<Key, Vec<Key>> = HashMap::new();
@@ -64,16 +71,8 @@ impl Vue {
                 kids.entry(*pk).or_default().push(k);
             }
         }
-        let mut intouchables = HashSet::new();
-        let mut cur = keys.get(&std::process::id()).copied();
-        while let Some(k) = cur {
-            if !intouchables.insert(k) {
-                break;
-            }
-            cur = parent.get(&k).copied();
-        }
-        let fenetres = sys::windows().into_keys().collect();
-        Vue { raws, keys, parent, kids, ports: sys::ports(), fenetres, intouchables }
+        let intouchables = crate::qol::ancestors(keys.get(&moi).copied(), |k| parent.get(&k).copied());
+        Vue { raws, keys, parent, kids, ports, fenetres, intouchables, cmd }
     }
     fn raw(&self, k: Key) -> Option<&Raw> {
         self.raws.iter().find(|r| r.pid == k.pid && r.create_time == k.ctime)
@@ -113,7 +112,7 @@ fn mo(b: u64) -> u64 {
 
 /// `C:\Dev\x\…` dans la ligne de commande → `C:\Dev\x`.
 fn projet(cmd: &str) -> Option<String> {
-    let low = cmd.to_lowercase();
+    let low = cmd.to_ascii_lowercase(); // même longueur que `cmd` : le découpage reste valide
     let i = low.find(r"c:\dev\")?;
     let rest = &cmd[i + 7..];
     let name: String = rest.chars().take_while(|c| !matches!(c, '\\' | '/' | '"' | ' ')).collect();
@@ -131,7 +130,7 @@ fn kind_of(name: &str) -> &'static str {
 /// Libellé lisible : « npm run dev », « vite », « node server.js », « cargo watch »… + (projet).
 fn label(name: &str, cmd: Option<&str>) -> String {
     let base = name.trim_end_matches(".exe").trim_end_matches(".EXE");
-    let low = cmd.unwrap_or("").to_lowercase();
+    let low = cmd.unwrap_or("").to_ascii_lowercase();
     let args = hunter::split_args(cmd.unwrap_or(""));
     let mut l = if let Some(p) = low.find(" run ").filter(|_| low.contains("npm") || low.contains("pnpm") || low.contains("yarn")) {
         let mgr = if low.contains("pnpm") {
@@ -188,10 +187,7 @@ fn serveurs(v: &Vue, session: u32) -> Vec<(Key, Vec<Key>)> {
         if v.interdit(&ks) {
             continue;
         }
-        let ia = [r.pid, root.pid].iter().any(|&pid| {
-            let c = sys::process_cmdline(pid).unwrap_or_default().to_ascii_lowercase();
-            c.contains("@anthropic-ai") || c.contains("claude-code")
-        });
+        let ia = [r.pid, root.pid].iter().any(|&pid| (v.cmd)(pid).map(|c| hunter::is_ai_cmd(&c)).unwrap_or(false));
         if !ia {
             out.push((root, ks));
         }
@@ -201,7 +197,7 @@ fn serveurs(v: &Vue, session: u32) -> Vec<(Key, Vec<Key>)> {
 
 fn docker_keys(v: &Vue) -> Vec<Key> {
     let mut ks: Vec<Key> = Vec::new();
-    for r in v.raws.iter().filter(|r| DOCKER.contains(&lower(r).as_str())) {
+    for r in v.raws.iter().filter(|r| hunter::is_docker_name(&lower(r))) {
         for k in v.arbre(v.keys[&r.pid]) {
             if !ks.contains(&k) {
                 ks.push(k);
@@ -220,7 +216,7 @@ pub fn etat() -> Etat {
     let v = Vue::lire();
     let mut items = Vec::new();
     for (root, ks) in serveurs(&v, sys::current_session()) {
-        let cmd = sys::process_cmdline(root.pid);
+        let cmd = (v.cmd)(root.pid);
         let name = v.raw(root).map(|r| r.name.clone()).unwrap_or_default();
         let mut ports: Vec<u16> = ks.iter().flat_map(|k| v.ports.get(&k.pid).into_iter().flatten().filter(|p| p.tcp).map(|p| p.port)).collect();
         ports.sort();
@@ -295,7 +291,7 @@ fn tuer_arbre(v: &Vue, ks: &[Key], c: &mut Coupe) -> (usize, u64) {
     // enfants d'abord
     for k in ks.iter().rev() {
         let Some(r) = v.raw(*k) else { continue };
-        match sys::kill(k.pid) {
+        match sys::kill(k.pid, k.ctime) {
             Ok(()) => {
                 n += 1;
                 b += r.private_ws;
@@ -315,14 +311,21 @@ fn tuer_arbre(v: &Vue, ks: &[Key], c: &mut Coupe) -> (usize, u64) {
 }
 
 pub fn couper(serv: bool, dock: bool, wsl: bool) -> Coupe {
-    let v = Vue::lire();
+    couper_vue(&Vue::lire(), serv, dock, wsl, None)
+}
+
+/// `seulement` : ne couper que ces racines de serveurs (tests).
+fn couper_vue(v: &Vue, serv: bool, dock: bool, wsl: bool, seulement: Option<&HashSet<u32>>) -> Coupe {
     let mut c = Coupe::default();
     let mut recs = Vec::new();
     let now = crate::journal::now();
     if serv {
-        for (root, ks) in serveurs(&v, sys::current_session()) {
+        for (root, ks) in serveurs(v, sys::current_session()) {
+            if seulement.map(|s| !s.contains(&root.pid)).unwrap_or(false) {
+                continue;
+            }
             let name = v.raw(root).map(|r| r.name.clone()).unwrap_or_default();
-            let (n, b) = tuer_arbre(&v, &ks, &mut c);
+            let (n, b) = tuer_arbre(v, &ks, &mut c);
             if n > 0 {
                 c.serveurs += 1;
                 c.libere += b;
@@ -331,12 +334,12 @@ pub fn couper(serv: bool, dock: bool, wsl: bool) -> Coupe {
         }
     }
     if dock {
-        let ks = docker_keys(&v);
+        let ks = docker_keys(v);
         if !ks.is_empty() {
             let b = v.ram(&ks);
             // proprement d'abord (`docker desktop stop`, Docker Desktop 4.37+), sinon on arrête ses processus
             if sys::run_hidden("docker", &["desktop", "stop"]).is_err() {
-                tuer_arbre(&v, &ks, &mut c);
+                tuer_arbre(v, &ks, &mut c);
             }
             let _ = sys::run_hidden("wsl.exe", &["--terminate", "docker-desktop"]);
             c.docker = true;
@@ -345,7 +348,7 @@ pub fn couper(serv: bool, dock: bool, wsl: bool) -> Coupe {
         }
     }
     if wsl {
-        let vm: u64 = wsl_raws(&v).iter().map(|r| r.ws.max(r.private_ws)).sum();
+        let vm: u64 = wsl_raws(v).iter().map(|r| r.ws.max(r.private_ws)).sum();
         if vm > 0 {
             match sys::run_hidden("wsl.exe", &["--shutdown"]) {
                 Ok(_) => {
@@ -386,9 +389,18 @@ fn fichier_veille() -> Option<std::path::PathBuf> {
     crate::app::Settings::dir().map(|d| d.join("veille.json"))
 }
 
+/// Ajoute les apps endormies à la liste (fusion avec la précédente : deux modes jeu de suite
+/// sans --apres-jeu ne perdent rien), sans doublons ni processus déjà terminés.
 pub fn noter_veille(keys: &[Key]) {
     let Some(p) = fichier_veille() else { return };
-    let v: Vec<Endormi> = keys.iter().map(|k| Endormi { pid: k.pid, ctime: k.ctime }).collect();
+    let mut v: Vec<Endormi> = std::fs::read(&p).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let vivants: HashSet<(u32, i64)> = sys::query_processes(&mut Vec::new()).into_iter().map(|r| (r.pid, r.create_time)).collect();
+    v.retain(|e| vivants.contains(&(e.pid, e.ctime)));
+    for k in keys {
+        if !v.iter().any(|e| e.pid == k.pid && e.ctime == k.ctime) {
+            v.push(Endormi { pid: k.pid, ctime: k.ctime });
+        }
+    }
     let _ = std::fs::create_dir_all(p.parent().unwrap());
     let _ = std::fs::write(p, serde_json::to_vec(&v).unwrap_or_default());
 }
@@ -404,7 +416,7 @@ pub fn reveiller() -> (usize, u64) {
     let vivants: HashSet<(u32, i64)> = sys::query_processes(&mut buf).into_iter().map(|r| (r.pid, r.create_time)).collect();
     let (mut n, mut total) = (0, 0u64);
     for e in list.into_iter().filter(|e| vivants.contains(&(e.pid, e.ctime))) {
-        if let Ok(b) = sys::prefetch(e.pid) {
+        if let Ok(b) = sys::prefetch(e.pid, e.ctime) {
             n += 1;
             total += b;
         }
@@ -418,4 +430,85 @@ pub struct Jeu {
     pub message: String,
     pub libere: u64,
     pub reveilles: usize,
+}
+
+#[cfg(test)]
+mod couper_tests {
+    use super::*;
+
+    fn raw(pid: u32, ppid: u32, name: &str) -> Raw {
+        Raw {
+            pid,
+            ppid,
+            name: name.into(),
+            create_time: pid as i64 * 10,
+            cpu_time: 0,
+            private_ws: 50 << 20,
+            commit: 0,
+            ws: 50 << 20,
+            io_read: 0,
+            io_write: 0,
+            io_other: 0,
+            threads: 4,
+            handles: 10,
+            session: sys::current_session(),
+            base_prio: 8,
+            suspended: false,
+        }
+    }
+
+    fn port(p: u16) -> Vec<Port> {
+        vec![Port { tcp: true, port: p, local_only: true }]
+    }
+
+    /// Sélection de --etat-dev / --couper-dev sur une vue factice (rien n'est tué).
+    #[test]
+    fn selection_des_serveurs() {
+        let raws = vec![
+            raw(10, 0, "cmd.exe"),
+            raw(11, 10, "node.exe"),   // npm run dev
+            raw(12, 11, "node.exe"),   // vite, écoute :5173
+            raw(20, 0, "node.exe"),    // serveur avec une fenêtre : non
+            raw(30, 0, "node.exe"),    // Claude Code : non
+            raw(40, 0, "python.exe"),  // pas de port : non
+            raw(50, 0, "node.exe"),    // parent de l'appelant (Vigie = 51) : non
+            raw(51, 50, "vigie.exe"),
+        ];
+        let mut ports = HashMap::new();
+        for (pid, p) in [(12, 5173), (20, 3000), (30, 4000), (50, 8080)] {
+            ports.insert(pid, port(p));
+        }
+        let fenetres: HashSet<u32> = [20].into_iter().collect();
+        let cmd = |pid: u32| match pid {
+            30 => Some(r"node C:\npm\node_modules\@anthropic-ai\claude-code\cli.js".to_string()),
+            11 => Some(r"node C:\npm\npm-cli.js run dev".to_string()),
+            _ => None,
+        };
+        let v = Vue::assembler(raws, ports, fenetres, 51, Box::new(cmd));
+        let s = serveurs(&v, sys::current_session());
+        let racines: Vec<u32> = s.iter().map(|(k, _)| k.pid).collect();
+        assert_eq!(racines, vec![11], "seul npm run dev (racine 11) doit être proposé");
+        assert_eq!(s[0].1.len(), 2, "arbre = npm + vite");
+    }
+
+    /// Vrai arrêt, limité à un node jetable (filtre `seulement`) : les vrais serveurs de
+    /// l'utilisateur ne peuvent pas être touchés.
+    #[test]
+    fn couper_un_faux_serveur() {
+        let _verrou = crate::TEST_PROCESSUS.lock().unwrap_or_else(|e| e.into_inner());
+        let js = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("tmp-couper.js");
+        std::fs::write(&js, "require('http').createServer((q,r)=>r.end()).listen(48129,'127.0.0.1')").unwrap();
+        let mut child = std::process::Command::new("node").arg(&js).spawn().unwrap();
+        let pid = child.id();
+        let t0 = std::time::Instant::now();
+        while !sys::ports().get(&pid).map(|p| p.iter().any(|x| x.port == 48129)).unwrap_or(false) && t0.elapsed().as_secs() < 5 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let seul: HashSet<u32> = [pid].into_iter().collect();
+        let c = couper_vue(&Vue::lire(), true, false, false, Some(&seul));
+        assert_eq!(c.serveurs, 1, "{:?}", c.erreurs);
+        assert!(c.libere > 0);
+        assert!(child.wait().is_ok());
+        let _ = std::fs::remove_file(js);
+    }
 }

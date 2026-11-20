@@ -88,7 +88,8 @@ pub struct Settings {
     /// mettre en veille (vider la RAM sans fermer) les apps en arrière-plan
     pub game_trim: bool,
     pub game_power: bool,
-    /// plan d'alimentation à restaurer en quittant le mode jeu
+    /// ancien emplacement du plan à restaurer : lu une fois pour migrer vers mode-jeu.json, jamais réécrit
+    #[serde(skip_serializing)]
     pub prev_power: Option<String>,
     /// historique de la recherche (autocomplétion)
     pub search_history: socle::autocomplete::History,
@@ -133,7 +134,7 @@ impl Settings {
         if let Some(d) = std::env::var_os("VIGIE_DATA_DIR") {
             return Some(std::path::PathBuf::from(d));
         }
-        dirs::config_dir().map(|d| d.join("Vigie"))
+        crate::sys::appdata().map(|d| d.join("Vigie"))
     }
     fn path() -> Option<std::path::PathBuf> {
         Self::dir().map(|d| d.join("settings.json"))
@@ -234,6 +235,25 @@ pub enum Action {
     StartupRefresh,
 }
 
+/// Textes d'un processus en minuscules, pour la recherche et le tri par nom.
+pub struct Low {
+    pub name: String,
+    pub title: String,
+    pub cmd: String,
+    pub desc: String,
+}
+
+impl Low {
+    fn of(p: &Proc, icons: &HashMap<Arc<str>, IconEntry>) -> Low {
+        Low {
+            name: p.name.to_lowercase(),
+            title: p.window.as_deref().unwrap_or("").to_lowercase(),
+            cmd: p.cmd.as_deref().unwrap_or("").to_lowercase(),
+            desc: p.path.as_deref().and_then(|pa| icons.get(pa)).and_then(|e| e.desc.as_deref()).unwrap_or("").to_lowercase(),
+        }
+    }
+}
+
 pub struct IconEntry {
     pub tex: Option<egui::TextureHandle>,
     pub desc: Option<String>,
@@ -273,7 +293,14 @@ pub struct App {
     /// recherche : autocomplétion floue (historique + noms, descriptions, ports en cours)
     pub search_ac: socle::autocomplete::Autocomplete,
     pub search_field: socle::ui::AutoField,
-    search_cands: Vec<String>,
+    /// empreinte (processus + icônes connues) des derniers candidats d'autocomplétion
+    cand_fp: u64,
+    /// minuscules de chaque processus (index = celui de `snap.procs`), calculées une fois par
+    /// mesure et seulement si une recherche ou le tri par nom en a besoin
+    lower: Vec<Low>,
+    lower_ok: bool,
+    /// V. Démarrage : RAM actuelle par exe de démarrage (calculée à la mesure, pas à l'image)
+    pub startup_ram: HashMap<String, (u64, usize)>,
     pub help: bool,
     pub game_dialog: bool,
     pub game_active: bool,
@@ -287,6 +314,8 @@ pub struct App {
     pub self_pid: u32,
     pub last_frame_ms: f32,
     pub minimized: bool,
+    /// une app est en plein écran (jeu, vidéo) : on traite les mesures sans dessiner
+    pub fullscreen: bool,
     /// mode sans fenêtre (--avant-jeu) : un processus resté inactif pendant toute la fenêtre de mesure
     /// est considéré inactif depuis son lancement
     pub headless: bool,
@@ -302,6 +331,10 @@ pub struct App {
     pub bb_pin: Option<(crate::qol::Metric, usize)>,
     /// V2 : projets en cours sous `dev_root`
     pub projects: Vec<crate::qol::Project>,
+    /// travaux longs en cours sur un thread (nettoyage, mode jeu)
+    job_tx: Sender<crate::travail::Fini>,
+    job_rx: Receiver<crate::travail::Fini>,
+    pub busy: usize,
     peaks_saved: std::time::Instant,
 }
 
@@ -319,6 +352,7 @@ impl App {
         let c2 = ctx.clone();
         let waker: Waker = Arc::new(std::sync::OnceLock::new());
         let w2 = waker.clone();
+        let (job_tx, job_rx) = std::sync::mpsc::channel();
         let docker_running = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let c4 = ctx.clone();
         let docker = crate::docker::spawn(docker_running.clone(), move || c4.request_repaint());
@@ -348,8 +382,9 @@ impl App {
                 }
             })
             .ok();
-        let game_active = s.prev_power.is_some();
         let mut s = s;
+        crate::travail::EtatJeu::migrer(s.prev_power.take());
+        let game_active = crate::travail::EtatJeu::load().actif;
         if let Ok(v) = std::env::var("VIGIE_VIEW") {
             s.view = match v.as_str() { "hunter" => View::Hunter, "perf" => View::Perf, "startup" => View::Startup, _ => View::Procs };
         }
@@ -380,7 +415,10 @@ impl App {
             palette: Default::default(),
             search_ac: socle::autocomplete::Autocomplete::new(s.search_history.clone()),
             search_field: Default::default(),
-            search_cands: Vec::new(),
+            cand_fp: 0,
+            lower: Vec::new(),
+            lower_ok: false,
+            startup_ram: HashMap::new(),
             help: false,
             game_dialog: false,
             game_active,
@@ -394,6 +432,7 @@ impl App {
             self_pid: std::process::id(),
             last_frame_ms: 0.0,
             minimized: false,
+            fullscreen: false,
             headless: false,
             waker,
             game_freed: 0,
@@ -404,6 +443,9 @@ impl App {
             blackbox: VecDeque::new(),
             bb_pin: None,
             projects: Vec::new(),
+            job_tx,
+            job_rx,
+            busy: 0,
             peaks_saved: std::time::Instant::now(),
             s,
         }
@@ -461,6 +503,9 @@ impl App {
             let tex = img.map(|im| self.ctx.load_texture(format!("ico:{path}"), im, egui::TextureOptions::LINEAR));
             self.icons.insert(path, IconEntry { tex, desc });
         }
+        while let Ok(f) = self.job_rx.try_recv() {
+            self.job_done(f);
+        }
         let mut latest = None;
         while let Ok(s) = self.rx.try_recv() {
             latest = Some(s);
@@ -471,6 +516,7 @@ impl App {
     }
 
     fn on_snapshot(&mut self, snap: Arc<Snapshot>) {
+        self.fullscreen = snap.fullscreen;
         let snap = if self.headless {
             let procs = snap.procs.iter().cloned().map(|mut p| {
                 if p.idle_secs >= 1.0 {
@@ -478,7 +524,7 @@ impl App {
                 }
                 p
             });
-            Arc::new(Snapshot { procs: procs.collect(), totals: snap.totals.clone(), cost_ms: snap.cost_ms, ncpu: snap.ncpu, parts: snap.parts.clone() })
+            Arc::new(Snapshot { procs: procs.collect(), totals: snap.totals.clone(), cost_ms: snap.cost_ms, ncpu: snap.ncpu, parts: snap.parts.clone(), fullscreen: snap.fullscreen })
         } else {
             snap
         };
@@ -546,20 +592,30 @@ impl App {
             self.s.save();
             self.peaks_saved = std::time::Instant::now();
         }
-        let mut cands: Vec<String> = Vec::with_capacity(snap.procs.len() + 32);
+        // candidats d'autocomplétion : reconstruits seulement si les processus (ou les descriptions
+        // connues, ou les ports) ont changé
+        let mut fp: u64 = self.icons.len() as u64;
         for p in &snap.procs {
-            cands.push(p.name.to_string());
-            if let Some(d) = p.path.as_ref().and_then(|pa| self.icons.get(pa)).and_then(|e| e.desc.clone()) {
-                cands.push(d);
+            fp = fp.wrapping_mul(31).wrapping_add(p.key.pid as u64 ^ p.key.ctime as u64 ^ p.ports.len() as u64);
+        }
+        if fp != self.cand_fp && !self.headless && !self.minimized {
+            self.cand_fp = fp;
+            let mut cands: Vec<String> = Vec::with_capacity(snap.procs.len() + 32);
+            for p in &snap.procs {
+                cands.push(p.name.to_string());
+                if let Some(d) = p.path.as_ref().and_then(|pa| self.icons.get(pa)).and_then(|e| e.desc.clone()) {
+                    cands.push(d);
+                }
+                cands.extend(p.ports.iter().filter(|x| x.tcp).map(|x| format!(":{}", x.port)));
             }
-            cands.extend(p.ports.iter().filter(|x| x.tcp).map(|x| format!(":{}", x.port)));
+            cands.sort();
+            cands.dedup();
+            self.search_ac.set_candidates(cands);
         }
-        cands.sort();
-        cands.dedup();
-        if cands != self.search_cands {
-            self.search_ac.set_candidates(cands.iter().cloned());
-            self.search_cands = cands;
+        if self.startup.is_some() && self.s.view == View::Startup {
+            self.startup_ram = crate::startup::ram_table(self.startup.as_deref().unwrap_or(&[]), &snap.procs);
         }
+        self.lower_ok = false;
         self.snap = Some(snap);
         self.rows_dirty = true;
     }
@@ -575,6 +631,13 @@ impl App {
         let procs = &snap.procs;
         let q = self.filter.trim().to_lowercase();
         let visible = |p: &Proc| !(self.s.hide_system && (p.session == 0 || p.key.pid <= 4));
+        if (!q.is_empty() || self.s.sort == Col::Name) && !self.lower_ok {
+            self.lower = procs.iter().map(|p| Low::of(p, &self.icons)).collect();
+            self.lower_ok = true;
+        }
+        let lower = &self.lower;
+        let by_key = &self.by_key;
+        let low = |p: &Proc| by_key.get(&p.key).and_then(|&i| lower.get(i));
         let matches = |p: &Proc| -> bool {
             if q.is_empty() {
                 return true;
@@ -582,13 +645,13 @@ impl App {
             if let Some(port) = q.strip_prefix(':') {
                 return p.ports.iter().any(|x| x.port.to_string().starts_with(port));
             }
+            let Some(l) = low(p) else { return false };
             q.split_whitespace().all(|w| {
-                socle::fuzzy::score(&p.name, w).is_some()
-                    || p.path.as_deref().and_then(|pa| self.icons.get(pa)).and_then(|e| e.desc.as_deref()).map(|d| socle::fuzzy::score(d, w).is_some()).unwrap_or(false)
+                socle::fuzzy::score(&l.name, w).is_some()
+                    || (!l.desc.is_empty() && (socle::fuzzy::score(&l.desc, w).is_some() || l.desc.contains(w)))
                     || p.key.pid.to_string() == w
-                    || p.window.as_deref().map(|t| t.to_lowercase().contains(w)).unwrap_or(false)
-                    || p.path.as_deref().and_then(|pa| self.icons.get(pa)).and_then(|e| e.desc.as_deref()).map(|d| d.to_lowercase().contains(w)).unwrap_or(false)
-                    || (w.len() >= 3 && p.cmd.as_deref().map(|c| c.to_lowercase().contains(w)).unwrap_or(false))
+                    || l.title.contains(w)
+                    || (w.len() >= 3 && l.cmd.contains(w))
             })
         };
         let sort = self.s.sort;
@@ -617,7 +680,7 @@ impl App {
                 }
             };
             let o = if sort == Col::Name {
-                a.name.to_lowercase().cmp(&b.name.to_lowercase())
+                low(a).map(|l| l.name.as_str()).cmp(&low(b).map(|l| l.name.as_str()))
             } else {
                 num(a, aa).partial_cmp(&num(b, ba)).unwrap_or(Ordering::Equal)
             };
@@ -804,8 +867,11 @@ impl App {
             }
             Action::Suspend(keys, on) => {
                 let mut err = None;
+                // déjà dans l'état demandé : on saute (les suspensions s'empileraient)
+                let now = sys::suspended_now();
+                let keys: Vec<Key> = keys.into_iter().filter(|k| now.contains(&(k.pid, k.ctime)) != on).collect();
                 for k in &keys {
-                    if let Some(e) = self.check_alive(*k).and_then(|_| sys::suspend(k.pid, on).err()) {
+                    if let Err(e) = sys::suspend(k.pid, k.ctime, on) {
                         err = Some(e);
                     }
                 }
@@ -818,7 +884,7 @@ impl App {
             Action::Priority(keys, p) => {
                 let mut err = None;
                 for k in &keys {
-                    if let Some(e) = self.check_alive(*k).and_then(|_| sys::set_priority(k.pid, p).err()) {
+                    if let Err(e) = sys::set_priority(k.pid, k.ctime, p) {
                         err = Some(e);
                     }
                 }
@@ -844,13 +910,9 @@ impl App {
             Action::Select(k) => self.select_key(k),
             Action::Clean(keys) => {
                 let ghosts: Vec<Ghost> = self.ghosts.iter().filter(|g| keys.contains(&g.key)).cloned().collect();
-                let (n, freed, errs) = self.clean(&ghosts);
-                if errs.is_empty() {
-                    self.toast(format!("Nettoyage : {n} fantôme(s) chassé(s) · ~{} libérés", human_bytes(freed)), false);
-                } else {
-                    self.toast(format!("{n} chassé(s), {} échec(s) : {}", errs.len(), errs[0]), true);
-                }
-                self.sample_now();
+                let plan = self.plan_chasses(&ghosts);
+                self.toast(format!("Nettoyage en cours ({} fantôme(s))…", plan.len()), false);
+                self.spawn_job(crate::travail::Travail::Nettoyer(plan));
             }
             Action::Whitelist(rule) => {
                 if !self.s.whitelist.contains(&rule) {
@@ -907,11 +969,16 @@ impl App {
             Action::SleepProject(dir) => {
                 let Some(pr) = self.projects.iter().find(|p| p.dir == dir).cloned() else { return };
                 let (mut n, mut freed, mut errs) = (0, 0u64, Vec::new());
+                let now = sys::suspended_now();
                 for k in &pr.keys {
-                    match sys::suspend(k.pid, true) {
+                    // déjà endormi : on ne suspend pas une 2e fois
+                    if now.contains(&(k.pid, k.ctime)) {
+                        continue;
+                    }
+                    match sys::suspend(k.pid, k.ctime, true) {
                         Ok(()) => {
                             n += 1;
-                            freed += sys::trim(k.pid).unwrap_or(0);
+                            freed += sys::trim(k.pid, k.ctime).unwrap_or(0);
                         }
                         Err(e) => errs.push(e),
                     }
@@ -927,10 +994,15 @@ impl App {
             Action::WakeProject(dir) => {
                 let Some(pr) = self.projects.iter().find(|p| p.dir == dir).cloned() else { return };
                 let mut n = 0;
+                let now = sys::suspended_now();
                 for k in &pr.keys {
-                    if sys::suspend(k.pid, false).is_ok() {
+                    // seulement ceux qui sont suspendus (état réel, pas la dernière mesure)
+                    if !now.contains(&(k.pid, k.ctime)) {
+                        continue;
+                    }
+                    if sys::suspend(k.pid, k.ctime, false).is_ok() {
                         n += 1;
-                        let _ = sys::prefetch(k.pid);
+                        let _ = sys::prefetch(k.pid, k.ctime);
                     }
                 }
                 self.toast(format!("Projet « {} » réveillé : {n} processus", pr.name), false);
@@ -953,11 +1025,6 @@ impl App {
                 let _ = std::process::Command::new("explorer.exe").arg(format!("https://www.google.com/search?q={q}+processus+windows")).spawn();
             }
         }
-    }
-
-    /// Le PID désigne-t-il toujours le même processus ? (protège contre la réutilisation des PID)
-    fn check_alive(&self, k: Key) -> Option<()> {
-        self.proc(k).map(|_| ())
     }
 
     fn kill_keys(&mut self, keys: &[Key], tree: bool) -> (usize, Vec<String>, u64) {
@@ -994,7 +1061,7 @@ impl App {
                 continue;
             }
             let mem = p.mem;
-            match sys::kill(k.pid) {
+            match sys::kill(k.pid, k.ctime) {
                 Ok(()) => {
                     ok += 1;
                     freed += mem;
@@ -1005,42 +1072,88 @@ impl App {
         (ok, errs, freed)
     }
 
-    pub fn clean(&mut self, ghosts: &[Ghost]) -> (usize, u64, Vec<String>) {
-        let (mut n, mut freed, mut errs) = (0, 0u64, Vec::new());
-        let mut recs = Vec::new();
-        for g in ghosts {
-            let res: Result<u64, String> = match &g.fix {
-                Fix::KillTree => {
-                    let (ok, e, f) = self.kill_keys_quiet(&[g.key], true);
-                    errs.extend(e);
-                    if ok > 0 { Ok(f) } else { Err(String::new()) }
+    /// Cibles d'un arbre (enfants d'abord), sans les processus vitaux ni Vigie.
+    fn cibles(&self, roots: &[Key]) -> Vec<crate::travail::Cible> {
+        let Some(snap) = &self.snap else { return Vec::new() };
+        let mut order: Vec<Key> = Vec::new();
+        for &r in roots {
+            order.extend(hunter::kill_order(&snap.procs, r));
+        }
+        let mut seen = HashSet::new();
+        order.retain(|k| seen.insert(*k));
+        order
+            .into_iter()
+            .filter_map(|k| self.proc(k))
+            .filter(|p| p.key.pid > 4 && p.key.pid != self.self_pid && !CRITICAL.contains(&p.name.to_ascii_lowercase().as_str()))
+            .map(|p| crate::travail::Cible { key: p.key, name: p.name.to_string(), mem: p.mem })
+            .collect()
+    }
+
+    /// Plan de chasse (exécuté sur un thread par `travail`).
+    pub fn plan_chasses(&self, ghosts: &[Ghost]) -> Vec<crate::travail::Chasse> {
+        use crate::travail::{Chasse, Remede};
+        ghosts
+            .iter()
+            .map(|g| Chasse {
+                name: g.name.clone(),
+                ram: g.ram,
+                remede: match &g.fix {
+                    Fix::KillTree => Remede::Tuer(self.cibles(&[g.key])),
+                    Fix::WslShutdown => Remede::WslShutdown,
+                    Fix::DockerStop(id) => Remede::DockerStop(id.clone()),
+                    Fix::DockerQuit => {
+                        let roots: Vec<Key> = self
+                            .snap
+                            .as_ref()
+                            .map(|s| s.procs.iter().filter(|p| hunter::is_docker_name(&p.name.to_ascii_lowercase())).map(|p| p.key).collect())
+                            .unwrap_or_default();
+                        Remede::DockerQuit(self.cibles(&roots))
+                    }
+                },
+            })
+            .collect()
+    }
+
+    pub fn spawn_job(&mut self, t: crate::travail::Travail) {
+        self.busy += 1;
+        let tx = self.job_tx.clone();
+        let waker = self.waker.clone();
+        let ctx = self.ctx.clone();
+        std::thread::Builder::new()
+            .name("travail".into())
+            .spawn(move || {
+                let _ = tx.send(crate::travail::executer(t));
+                match waker.get() {
+                    Some(w) => w(),
+                    None => ctx.request_repaint(),
                 }
-                Fix::WslShutdown => sys::run_hidden("wsl.exe", &["--shutdown"]).map(|_| g.ram).map_err(|e| format!("wsl --shutdown : {e}")),
-                Fix::DockerStop(id) => crate::docker::stop(id).map(|_| g.ram).map_err(|e| format!("docker stop : {e}")),
-                Fix::DockerQuit => {
-                    let keys: Vec<Key> = self
-                        .snap
-                        .as_ref()
-                        .map(|s| s.procs.iter().filter(|p| p.name.eq_ignore_ascii_case("Docker Desktop.exe") || p.name.eq_ignore_ascii_case("com.docker.backend.exe")).map(|p| p.key).collect())
-                        .unwrap_or_default();
-                    let (_, e, f) = self.kill_keys_quiet(&keys, true);
-                    errs.extend(e);
-                    let _ = sys::run_hidden("wsl.exe", &["--terminate", "docker-desktop"]);
-                    Ok(f.max(g.ram))
-                }
-            };
-            match res {
-                Ok(f) => {
-                    n += 1;
-                    freed += f;
-                    recs.push(crate::journal::Rec { t: crate::journal::now(), what: "chassé".into(), name: g.name.clone(), bytes: f });
-                }
-                Err(e) if !e.is_empty() => errs.push(e),
-                Err(_) => {}
+            })
+            .ok();
+    }
+
+    fn job_done(&mut self, f: crate::travail::Fini) {
+        self.busy = self.busy.saturating_sub(1);
+        self.log(f.journal);
+        if f.jeu {
+            self.game_active = true;
+            self.game_freed += f.libere;
+        }
+        if f.message.starts_with("Mode jeu terminé") {
+            self.game_active = false;
+        }
+        self.toast(f.message, f.erreur);
+        self.sample_now();
+    }
+
+    /// Mode sans fenêtre : attend la fin des travaux lancés.
+    pub fn wait_jobs(&mut self, timeout: Duration) {
+        let t0 = std::time::Instant::now();
+        while self.busy > 0 && t0.elapsed() < timeout {
+            match self.job_rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(f) => self.job_done(f),
+                Err(_) => continue,
             }
         }
-        self.log(recs);
-        (n, freed, errs)
     }
 
     pub fn log(&mut self, recs: Vec<crate::journal::Rec>) {
@@ -1053,23 +1166,10 @@ impl App {
 
     /// Vide la RAM des processus sans les fermer.
     pub fn trim_keys(&mut self, keys: &[Key]) -> (usize, u64, Vec<String>) {
-        let (mut n, mut freed, mut errs) = (0, 0u64, Vec::new());
-        let mut by_name: HashMap<String, u64> = HashMap::new();
-        for &k in keys {
-            let Some(p) = self.proc(k) else { continue };
-            let name = p.name.to_string();
-            match sys::trim(k.pid) {
-                Ok(f) => {
-                    n += 1;
-                    freed += f;
-                    *by_name.entry(name).or_default() += f;
-                }
-                Err(e) => errs.push(format!("{name} : {e}")),
-            }
-        }
-        let t = crate::journal::now();
-        let recs = by_name.into_iter().filter(|(_, b)| *b > 1 << 20).map(|(name, bytes)| crate::journal::Rec { t, what: "veille".into(), name, bytes }).collect();
+        let cibles: Vec<crate::travail::Cible> = keys.iter().filter_map(|k| self.proc(*k)).map(|p| crate::travail::Cible { key: p.key, name: p.name.to_string(), mem: p.mem }).collect();
+        let (n, freed, recs) = crate::travail::endormir(&cibles);
         self.log(recs);
+        let errs = if n == 0 && !cibles.is_empty() { vec!["accès refusé (processus protégé ?)".to_string()] } else { Vec::new() };
         (n, freed, errs)
     }
 
@@ -1102,103 +1202,26 @@ impl App {
         self.ghosts.iter().filter(|g| g.safe).cloned().collect()
     }
 
+    /// Mode avant de jouer : le plan est préparé ici, exécuté sur un thread (aucun gel).
     pub fn run_game_mode(&mut self) {
-        let mut parts = Vec::new();
-        let mut errs = Vec::new();
-        if self.s.game_kill {
-            let g = self.safe_ghosts();
-            let (n, freed, e) = self.clean(&g);
-            self.game_freed += freed;
-            if n > 0 {
-                parts.push(format!("{n} fantôme(s), {}", human_bytes(freed)));
-            }
-            errs.extend(e);
-        }
-        if self.s.game_trim {
-            let keys = self.trim_candidates();
-            let (n, freed, _) = self.trim_keys(&keys);
-            // retenus pour le réveil de --apres-jeu / « Quitter le mode jeu »
-            crate::cli::noter_veille(&keys);
-            self.game_freed += freed;
-            if n > 0 && freed > 0 {
-                parts.push(format!("{n} app(s) en veille, {}", human_bytes(freed)));
-            }
-        }
-        if self.s.game_purge && self.elevated {
-            let before = sys::standby_bytes().unwrap_or(0);
-            match sys::purge_standby() {
-                Ok(()) => {
-                    parts.push(format!("cache vidé ({})", human_bytes(before)));
-                    self.log(vec![crate::journal::Rec { t: crate::journal::now(), what: "cache".into(), name: "mémoire en veille".into(), bytes: before }]);
-                }
-                Err(e) => errs.push(e),
-            }
-        }
-        if self.s.game_power {
-            match enter_power() {
-                Ok(Some(prev)) => {
-                    if self.s.prev_power.is_none() {
-                        self.s.prev_power = Some(prev);
-                    }
-                    parts.push("plan Performances élevées".into());
-                }
-                Ok(None) => {}
-                Err(e) => errs.push(format!("plan d’alimentation : {e}")),
-            }
-        }
+        let plan = crate::travail::PlanJeu {
+            chasses: if self.s.game_kill { self.plan_chasses(&self.safe_ghosts()) } else { Vec::new() },
+            veille: if self.s.game_trim {
+                self.trim_candidates().into_iter().filter_map(|k| self.proc(k)).map(|p| crate::travail::Cible { key: p.key, name: p.name.to_string(), mem: p.mem }).collect()
+            } else {
+                Vec::new()
+            },
+            purge: self.s.game_purge && self.elevated,
+            power: self.s.game_power,
+        };
         self.game_active = true;
-        self.s.save();
-        let msg = if parts.is_empty() { "Mode jeu actif — rien à nettoyer".to_string() } else { format!("Mode jeu : {}", parts.join(" · ")) };
-        if errs.is_empty() {
-            self.toast(msg, false);
-        } else {
-            self.toast(format!("{msg} — {}", errs[0]), true);
-        }
-        self.sample_now();
+        self.toast("Mode jeu en cours…", false);
+        self.spawn_job(crate::travail::Travail::Jeu(plan));
     }
 
     pub fn exit_game_mode(&mut self) {
-        let (msg, err, _) = finish_game(&mut self.s);
-        self.toast(msg, err);
-        self.game_active = false;
+        self.spawn_job(crate::travail::Travail::Finir);
     }
-}
-
-/// Fin du mode jeu : restaure le plan d'alimentation et réveille les apps mises en veille.
-/// Partagé par l'interface et `--apres-jeu` (qui n'ouvre ni fenêtre ni thread de mesure).
-pub fn finish_game(s: &mut Settings) -> (String, bool, usize) {
-    let mut parts = vec!["Mode jeu terminé".to_string()];
-    let mut err = false;
-    if let Some(prev) = s.prev_power.take() {
-        match sys::set_power_scheme(&prev) {
-            Ok(()) => parts.push(format!("plan « {} » restauré", sys::power_scheme_name(&prev))),
-            Err(e) => {
-                parts.push(format!("plan d’alimentation : {e}"));
-                err = true;
-            }
-        }
-    }
-    let (n, b) = crate::cli::reveiller();
-    if n > 0 {
-        parts.push(format!("{n} app(s) réveillée(s) ({} préchargés)", human_bytes(b)));
-    }
-    s.save();
-    (parts.join(" · "), err, n)
-}
-
-/// Passe en Performances élevées ; renvoie le plan précédent (à restaurer).
-pub fn enter_power() -> Result<Option<String>, String> {
-    let prev = sys::active_power_scheme();
-    // déjà en Performances élevées / optimales (Ultimate, y compris ses copies) : ne surtout pas rétrograder
-    if prev.as_deref() == Some(sys::HIGH_PERF) || sys::active_power_is_max() {
-        return Ok(None);
-    }
-    if sys::set_power_scheme(sys::HIGH_PERF).is_err() {
-        // plan masqué sur certains PC : on le recrée depuis le modèle Windows
-        let _ = sys::run_hidden("powercfg.exe", &["-duplicatescheme", sys::HIGH_PERF, sys::HIGH_PERF]);
-        sys::set_power_scheme(sys::HIGH_PERF)?;
-    }
-    Ok(prev)
 }
 
 /// Les tuer provoque un écran bleu ou une déconnexion.

@@ -5,7 +5,7 @@
 Vigie est le gestionnaire de tâches Windows de l'utilisateur. Il remplace le Gestionnaire des tâches de Windows (option Ctrl+Maj+Échap) et intègre un **chasseur de RAM fantôme** : il repère ce qui tourne pour rien (serveurs de dev oubliés, orphelins, apps cachées, Docker/WSL) et propose de le nettoyer, surtout avant de jouer.
 
 Principes :
-- **Légèreté mesurée** (socle v0.1.3, fenêtre de test invisible qui dessine vraiment, `scratchpad/mesure.ps1`, 60 s au repos) : **fenêtre ouverte** 34,8 Mo privés (47,8 Mo avec le socle v0.1.2 : la police emoji pesait 13 Mo), 1 à 2 % d'un cœur selon la charge (une mesure + une image par seconde) ; **fenêtre réduite** 1,5 Mo privés / 9,3 Mo de plage de travail, **0,03 % d'un cœur** (une mesure toutes les 10 s, sans compteurs PDH, aucune image). Exe ~5,8 Mo.
+- **Légèreté mesurée** (socle v0.1.4, fenêtre de test invisible qui dessine vraiment, `scratchpad/mesure.ps1`, 60 s au repos) : **fenêtre ouverte** 34,6 Mo privés, ~1 % d'un cœur (une mesure + une image par seconde) ; **fenêtre réduite ou jeu en plein écran** ~13 Mo, **~0,1 % d'un cœur** (une mesure toutes les 10 s, sans compteurs PDH, aucune image). Avant le socle v0.1.3 : 47,8 Mo (police emoji). Exe ~5,8 Mo.
 - **Zéro coût fermé** : pas de service, de tray ni de démarrage auto.
 - **Rien n'est redessiné sans raison** : l'interface attend une mesure ou une action.
 - **Prudence** : rien n'est tué sans confirmation ou case cochée. Liste de processus protégés. Services et session 0 jamais proposés.
@@ -14,7 +14,7 @@ Principes :
 ## 2. Stack
 
 - **Langage** : Rust, édition 2024 (rustc 1.99). Crate `vigie` v0.1.0.
-- **Socle commun** : crate `socle` (tag v0.1.3, `https://github.com/Desarrh/socle`, polices par défaut : ni gras ni emoji), features `ui`, `settings`, `crash`, `instance`, `testmode` : thème, icônes vectorielles, palette Ctrl+K, autocomplétion floue, toasts, raccourcis AZERTY, instance unique, journal de plantage, mode test. En local, `.cargo/config.toml` (non versionné) le remplace par `../socle`.
+- **Socle commun** : crate `socle` (tag v0.1.4, `https://github.com/Desarrh/socle`, polices par défaut : ni gras ni emoji ; compilé depuis le tag publié (`.cargo/config.toml` vers `../socle` désactivé : la copie locale contient des modifications en cours)), features `ui`, `settings`, `crash`, `instance`, `testmode` : thème, icônes vectorielles, palette Ctrl+K, autocomplétion floue, toasts, raccourcis AZERTY, instance unique, journal de plantage, mode test. En local, `.cargo/config.toml` (non versionné) le remplace par `../socle`.
 - **Interface** : `egui` 0.37.0, `egui-winit` 0.37.0 (clipboard, links), `winit` 0.30.13.
 - **Rendu CPU** : `softbuffer` 0.4.8 (présentation GDI), `hdrshot-egui-backend` 0.2.0 (rastériseur logiciel, importé comme `egui_software_backend`), `bytemuck` 1. Il n'y a **aucun contexte GPU**.
 - **Données** : `serde` 1 + `serde_json` 1 (réglages, journal, sortie `docker`), `image` 0.25.10 (PNG seulement : icône, captures de debug), `dirs` 7.0.0.
@@ -51,14 +51,17 @@ Principes :
 | `hunter.rs` | Règles du chasseur → liste de `Ghost` (catégorie, raison, RAM de l'arbre, « sûr », remède, règle de liste blanche) |
 | `docker.rs` | Thread qui interroge `docker ps` / `docker stats` toutes les 20 s, seulement si `com.docker.backend.exe` tourne |
 | `startup.rs` | Apps au démarrage : clés Run HKCU/HKLM/WOW64, dossiers Démarrage, activation via `StartupApproved` |
-| `cli.rs` | Interface sans fenêtre pour les autres applis : `--etat-dev`, `--couper-dev`, réveil des apps endormies (JSON) |
+| `cli.rs` | Interface sans fenêtre pour les autres applis (vue `Vue::assembler` injectable pour les tests) : `--etat-dev`, `--couper-dev`, réveil des apps endormies (JSON) |
 | `qol.rs` | Pistes validées : V2 projets (`project_of`, `projects`), V3 pics des jeux (`is_game_path`, `track_games`, `missing`), V4 boîte noire (`Moment`, top 5 par ressource), tout calculé sur l'instantané |
+| `travail.rs` | Actions longues sur un thread (chasse, mode jeu, fin du mode jeu) à partir d'un plan préparé par l'interface ; état du mode jeu dans `mode-jeu.json` |
 | `journal.rs` | Journal des nettoyages en JSONL (append, lecture des N derniers jours, compactage à 90 jours) |
 | `winfo.rs` | Description lisible d'un exe (ressource `FileDescription`) |
 
 **Threads**
 - **Interface** (winit) : en `ControlFlow::Wait`, il ne redessine que sur un événement, une mesure reçue, ou un `request_repaint` (toast, icône).
 - **« echantillonnage »** : boucle mesure → envoi `Arc<Snapshot>` par `mpsc` → réveil de la boucle (`UserEvent::Sample`, pas `request_repaint` : egui ne relaie plus les demandes quand aucune image n'est dessinée). Fenêtre réduite : la mesure est traitée sans dessiner (pics des jeux V3, boîte noire V4, chasseur restent à jour). Il attend ensuite sur `recv_timeout` du canal de commandes (intervalle, GPU, mesure immédiate, arrière-plan). Fenêtre réduite : au moins 10 s entre deux mesures (`BACKGROUND_INTERVAL`), compteurs PDH (GPU, disque, réseau) coupés, ports une mesure sur trois.
+- **« travail »** (à la demande) : exécute un plan (`travail::Travail`) — kill d'arbres, `wsl --shutdown`, `docker stop`, purge, plan d'alimentation, réveil — et renvoie un `Fini` (toast + journal). L'interface ne bloque jamais.
+- Jeu ou vidéo **en plein écran** (`SHQueryUserNotificationState` : D3D plein écran, occupé, présentation) : même régime que la fenêtre réduite, mesure traitée sans dessin.
 - **« icones »** : il reçoit les chemins d'exe et renvoie l'icône RGBA et la description. Chaque chemin n'est chargé qu'une fois.
 - **« docker »** : il dort 5 s tant que Docker est arrêté, puis interroge toutes les 20 s.
 
@@ -183,6 +186,9 @@ Elle vient du **socle** (`socle::theme`, `socle::icons`, `socle::ui`) depuis la 
 - `--set-taskmgr on|off` : instance élevée éphémère qui écrit la clé IFEO.
 - `--avant-jeu` / `--apres-jeu` (`--json` en option) : sans fenêtre. `--apres-jeu` n'ouvre ni egui ni thread de mesure (~20 ms).
 - `--etat-dev` (1 ligne JSON `{"v":1,"items":[{kind,label,pids,ram_mo,…}],"total_mo"}`, format défini avec Ultimate, ~20–30 ms) et `--couper-dev [--serveurs] [--docker] [--wsl] [--json]` (résumé d'une ligne, sans UAC) : garde-fou dev T2 (`src/cli.rs`, exemples dans le README). Ne touche jamais un arbre avec fenêtre visible, l'appelant et ses ancêtres, Ultimate.exe.
+- **Remplacer le Gestionnaire des tâches** : l'instance élevée (`--set-taskmgr on`) copie l'exe dans `%ProgramFiles%\Vigie\Vigie.exe` et inscrit **ce chemin-là** dans IFEO (un exe sous `C:\Dev\…` est modifiable sans admin : l'inscrire ouvrirait une porte). « off » efface la clé et la copie. L'instance non élevée vérifie ensuite la clé et la présence de la copie (détecte une écriture redirigée). Limite : la copie de Program Files ne se met pas à jour toute seule (recocher l'option après une mise à jour).
+- **Mode jeu** : l'état (`actif`, plan d'alimentation à restaurer) est dans `%APPDATA%\Vigie\mode-jeu.json`, géré seulement par le mode jeu ; un ancien `prev_power` de settings.json est migré une fois.
+- **Virtualisation MSIX** : lancés depuis l'app Claude, nos processus écrivent les nouveaux fichiers d'AppData dans `…\Packages\Claude_…\LocalCache`. Tests et données de test sous `C:\Dev\vigie\target\` ; pour relancer la vraie Vigie : `explorer.exe "C:\Dev\vigie\dist\Vigie.exe"`.
 - Ressource de version `VigieCli` = « avant-jeu apres-jeu etat-dev couper-dev memoire-jeu memoire-jeu-dossier » (`build.rs`) : Ultimate y vérifie les commandes comprises avant de les appeler. **Toute nouvelle commande sans fenêtre doit y être ajoutée.**
 - `--memoire-jeu <exe | dossier d'installation>` : `{"v":1,"connu":true,"nom","exe","chemin","pic_mo","disponible_mo","manque_mo"}` (V3) ; avec un dossier, le plus gros pic connu sous ce dossier (marqueur `memoire-jeu-dossier`).
 - `%APPDATA%\Vigie\veille.json` : apps endormies par `--avant-jeu`, consommé par `--apres-jeu`.
@@ -215,9 +221,20 @@ Elle vient du **socle** (`socle::theme`, `socle::icons`, `socle::ui`) depuis la 
 - V3 pics de RAM par jeu : vérifié avec un faux jeu dans un faux `steamapps\common` ; `--memoire-jeu`.
 - V4 boîte noire : survol + épinglage sur les graphiques Performances.
 
+**Audit ponytail (corrigé, tests automatiques)**
+- Fenêtre sur un autre bureau virtuel (`DWM_CLOAKED_SHELL`) = vraie fenêtre : Edge sur le bureau 2 n'est plus proposé au chasseur ni à `--avant-jeu`.
+- Suspendre / sieste : état réel relu juste avant (`sys::suspended_now`), plus de suspensions empilées.
+- kill, suspendre, priorité, mise en veille, préchargement : date de création vérifiée (`GetProcessTimes` = `Key::ctime`) contre la réutilisation de PID.
+- Découpages de chaînes en minuscules ASCII (plus de panique sur certains caractères).
+- `veille.json` fusionné (deux modes jeu de suite sans `--apres-jeu` ne perdent rien).
+- Nom du plan d'alimentation par `PowerReadFriendlyName` (plus aucun powercfg, sauf pour recréer un plan masqué).
+- Règles partagées : `hunter::is_ai_cmd` (Claude Code, Claude, Copilot, Codex), `hunter::DOCKER_PROCS`, `qol::ancestors` (intouchables) dans le chasseur, la sieste et `--couper-dev`. `dirs` retiré (`%APPDATA%` lu directement).
+- Démarrage : table RAM calculée à la mesure ; autocomplétion reconstruite seulement si les processus changent ; minuscules calculées une fois par mesure ; « plus gros consommateurs » = top 5 de la boîte noire.
+- Tests : 24 (+1 ignoré) — chasseur sur faux instantanés (Edge sans fenêtre sûr, avec fenêtre non, agent IA non, ancêtre de Vigie non, arbre protégé non), `--couper-dev` (sélection sur vue factice + vrai arrêt limité à un node jetable), mode jeu sur thread avec fusion de veille.json ; les tests qui lancent des processus sont sérialisés (`TEST_PROCESSUS`).
+
 **Pas testé en vrai**
 - **Docker** : Docker Desktop était arrêté. Seul le parsing est testé.
-- **Remplacement du Gestionnaire des tâches** : demande l'UAC.
+- **Remplacement du Gestionnaire des tâches** : demande l'UAC (copie dans Program Files + clé IFEO) ; non exécuté pendant le développement (règle n°0).
 - **Vidage de la mémoire en veille** : nécessite l'admin.
 - **Mise en veille des vraies apps** de l'utilisateur via le mode jeu.
 - **Désactivation d'une vraie entrée** de démarrage.

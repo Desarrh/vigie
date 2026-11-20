@@ -11,8 +11,14 @@ mod qol;
 mod sampler;
 mod startup;
 mod sys;
+mod travail;
 mod ui;
 mod winfo;
+
+/// Tests qui lancent de vrais processus jetables : un à la fois (sinon la sieste de projet
+/// endormirait les processus des autres tests, tous sous C:\Dev\vigie).
+#[cfg(test)]
+pub static TEST_PROCESSUS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 use egui_software_backend::{BufferMutRef, ColorFieldOrder, EguiSoftwareRender};
 use std::num::NonZeroU32;
@@ -180,13 +186,15 @@ impl ApplicationHandler<UserEvent> for Runner {
             UserEvent::RepaintAt(t) => t,
             UserEvent::Sample => {
                 // réduite : on traite la mesure sans dessiner ; sinon une image normale
-                match self.app.as_mut() {
-                    Some(app) if app.minimized => app.tick(),
-                    _ => {
-                        if let Some(g) = &self.gfx {
-                            g.window.request_redraw();
-                        }
+                // réduite, ou jeu / vidéo en plein écran par-dessus : mesure traitée, aucune image
+                if let Some(app) = self.app.as_mut() {
+                    app.tick();
+                    if app.minimized || app.fullscreen {
+                        return;
                     }
+                }
+                if let Some(g) = &self.gfx {
+                    g.window.request_redraw();
                 }
                 return;
             }
@@ -253,11 +261,14 @@ fn headless_game(enter: bool, json: bool) -> i32 {
             a.tick();
         }
         a.run_game_mode();
+        // sans fenêtre : on attend la fin du travail (thread) avant de répondre
+        a.wait_jobs(Duration::from_secs(60));
         (a.last_toast().unwrap_or_default(), a.game_freed, 0)
     } else {
         // léger : ni egui ni thread de mesure
-        let mut s = app::Settings::load();
-        let (msg, _, n) = app::finish_game(&mut s);
+        // reprend un ancien prev_power resté dans settings.json, puis termine le mode jeu
+        travail::EtatJeu::migrer(app::Settings::load().prev_power);
+        let (msg, _, n) = travail::finir();
         (msg, 0, n)
     };
     if json {

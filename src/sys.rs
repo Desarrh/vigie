@@ -200,6 +200,23 @@ fn open(pid: u32, access: u32) -> Option<Handle> {
     if h.is_null() { None } else { Some(Handle(h)) }
 }
 
+/// Date de création (100 ns, comme `CreateTime` du noyau) d'un processus ouvert.
+fn creation_time(h: &Handle) -> Option<i64> {
+    let (mut c, mut e, mut k, mut u) = (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+    (unsafe { th::GetProcessTimes(h.0, &mut c, &mut e, &mut k, &mut u) } != 0).then(|| ft(c) as i64)
+}
+
+/// Ouvre le processus `pid` **seulement s'il s'agit toujours du même** (même date de création que
+/// `ctime`) : un PID libéré peut être réutilisé par un autre processus entre la mesure et l'action.
+fn open_checked(pid: u32, ctime: i64, access: u32, what: &str) -> Result<Handle, String> {
+    let h = open(pid, access | th::PROCESS_QUERY_LIMITED_INFORMATION).ok_or_else(|| access_err(what))?;
+    match creation_time(&h) {
+        Some(t) if t == ctime => Ok(h),
+        Some(_) => Err("ce processus s’est terminé (son PID a été réutilisé)".into()),
+        None => Err(last_err()),
+    }
+}
+
 /// Chemin complet de l'exe (accès « limité » : marche sans admin pour les processus de l'utilisateur).
 pub fn process_path(pid: u32) -> Option<String> {
     let h = open(pid, th::PROCESS_QUERY_LIMITED_INFORMATION)?;
@@ -247,7 +264,9 @@ pub fn windows() -> HashMap<u32, String> {
             }
             let mut cloaked = 0u32;
             windows_sys::Win32::Graphics::Dwm::DwmGetWindowAttribute(h, 14 /* DWMWA_CLOAKED */, (&mut cloaked as *mut u32).cast(), 4);
-            if cloaked != 0 {
+            // DWM_CLOAKED_SHELL (2) = sur un autre bureau virtuel : c'est une vraie fenêtre.
+            // Seules les fenêtres masquées par l'app elle-même ou héritées (1, 4) sont ignorées.
+            if cloaked & !2 != 0 {
                 return 1;
             }
             let len = wm::GetWindowTextLengthW(h);
@@ -425,16 +444,16 @@ pub fn standby_bytes() -> Option<u64> {
 }
 
 // ---------- Actions ----------
-pub fn kill(pid: u32) -> Result<(), String> {
-    let h = open(pid, th::PROCESS_TERMINATE).ok_or_else(|| access_err("tuer"))?;
+pub fn kill(pid: u32, ctime: i64) -> Result<(), String> {
+    let h = open_checked(pid, ctime, th::PROCESS_TERMINATE, "tuer")?;
     if unsafe { th::TerminateProcess(h.0, 1) } == 0 {
         return Err(last_err());
     }
     Ok(())
 }
 
-pub fn suspend(pid: u32, on: bool) -> Result<(), String> {
-    let h = open(pid, 0x0800 /* PROCESS_SUSPEND_RESUME */).ok_or_else(|| access_err("suspendre"))?;
+pub fn suspend(pid: u32, ctime: i64, on: bool) -> Result<(), String> {
+    let h = open_checked(pid, ctime, 0x0800 /* PROCESS_SUSPEND_RESUME */, "suspendre")?;
     let st = unsafe { if on { NtSuspendProcess(h.0) } else { NtResumeProcess(h.0) } };
     if st < 0 { Err(format!("échec (0x{st:08X})")) } else { Ok(()) }
 }
@@ -494,8 +513,8 @@ impl Prio {
     }
 }
 
-pub fn set_priority(pid: u32, p: Prio) -> Result<(), String> {
-    let h = open(pid, th::PROCESS_SET_INFORMATION).ok_or_else(|| access_err("modifier"))?;
+pub fn set_priority(pid: u32, ctime: i64, p: Prio) -> Result<(), String> {
+    let h = open_checked(pid, ctime, th::PROCESS_SET_INFORMATION, "modifier")?;
     if unsafe { th::SetPriorityClass(h.0, p.class()) } == 0 {
         return Err(last_err());
     }
@@ -526,9 +545,9 @@ fn access_err(what: &str) -> String {
 /// Vide la plage de travail d'un processus sans le fermer : ses pages partent en mémoire « modifiée / en veille »
 /// et la RAM redevient disponible ; il les relira (un peu plus lentement) quand il en aura besoin.
 /// Renvoie les octets libérés (plage de travail avant − après).
-pub fn trim(pid: u32) -> Result<u64, String> {
+pub fn trim(pid: u32, ctime: i64) -> Result<u64, String> {
     use windows_sys::Win32::System::ProcessStatus::{K32EmptyWorkingSet, K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
-    let h = open(pid, 0x0100 /* PROCESS_SET_QUOTA */ | th::PROCESS_QUERY_LIMITED_INFORMATION).ok_or_else(|| access_err("mettre en veille"))?;
+    let h = open_checked(pid, ctime, 0x0100 /* PROCESS_SET_QUOTA */, "mettre en veille")?;
     let ws = || {
         let mut c: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
         c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
@@ -545,10 +564,9 @@ pub fn trim(pid: u32) -> Result<u64, String> {
 /// en arrière-plan, en grosses lectures, au lieu de défauts de page un par un au premier clic.
 /// Les pages reviennent en cache « en veille » et sont remappées sans disque quand l'app y touche.
 /// Renvoie les octets demandés.
-pub fn prefetch(pid: u32) -> Result<u64, String> {
+pub fn prefetch(pid: u32, ctime: i64) -> Result<u64, String> {
     use windows_sys::Win32::System::Memory::*;
-    let h = open(pid, th::PROCESS_QUERY_INFORMATION | 0x0008 /* PROCESS_VM_OPERATION */ | 0x0010 /* PROCESS_VM_READ */)
-        .ok_or_else(|| access_err("réveiller"))?;
+    let h = open_checked(pid, ctime, th::PROCESS_QUERY_INFORMATION | 0x0008 /* PROCESS_VM_OPERATION */ | 0x0010 /* PROCESS_VM_READ */, "réveiller")?;
     let mut ranges: Vec<WIN32_MEMORY_RANGE_ENTRY> = Vec::new();
     let mut addr: usize = 0;
     let mut total: u64 = 0;
@@ -576,6 +594,12 @@ pub fn prefetch(pid: u32) -> Result<u64, String> {
         return Err(last_err());
     }
     Ok(total)
+}
+
+/// Processus suspendus **maintenant** (lecture noyau fraîche, ~3 ms) : la dernière mesure peut
+/// dater d'une seconde, et suspendre deux fois empile les suspensions.
+pub fn suspended_now() -> std::collections::HashSet<(u32, i64)> {
+    query_processes(&mut Vec::new()).into_iter().filter(|r| r.suspended).map(|r| (r.pid, r.create_time)).collect()
 }
 
 /// PID de la fenêtre au premier plan.
@@ -694,24 +718,29 @@ pub fn set_power_scheme(guid: &str) -> Result<(), String> {
     if r == 0 { Ok(()) } else { Err(std::io::Error::from_raw_os_error(r as i32).to_string()) }
 }
 
-/// Nom du plan actif tel que Windows l'affiche (powercfg, appelé seulement à la demande).
-pub fn active_power_label() -> Option<String> {
-    let out = run_hidden("powercfg.exe", &["/getactivescheme"]).ok()?;
-    let (a, b) = (out.find('(')?, out.rfind(')')?);
-    (b > a).then(|| out[a + 1..b].trim().to_string())
+/// Nom d'un plan tel que Windows l'affiche (« Ultimate Performance », « Utilisation normale »…),
+/// lu par `PowerReadFriendlyName` : un appel d'API, aucun processus lancé.
+pub fn power_label(guid: &str) -> Option<String> {
+    use windows_sys::Win32::System::Power::PowerReadFriendlyName;
+    let g = parse_guid(guid)?;
+    let mut buf = [0u16; 256];
+    let mut size = (buf.len() * 2) as u32;
+    let r = unsafe { PowerReadFriendlyName(std::ptr::null_mut(), &g, std::ptr::null(), std::ptr::null(), buf.as_mut_ptr().cast(), &mut size) };
+    (r == 0).then(|| from_wide(&buf)).filter(|s| !s.is_empty())
 }
 
-/// Le plan actif est-il déjà un plan « performances maximales » (Élevées, Optimales / Ultimate) ?
-pub fn active_power_is_max() -> bool {
-    let Some(l) = active_power_label().map(|l| l.to_lowercase()) else { return false };
-    ["ultimate", "optimal", "high perf", "élevées", "elevees", "maximal"].iter().any(|k| l.contains(k))
+/// Plan actif : (GUID, nom, déjà « performances maximales » ?). Un seul passage, sans powercfg.
+pub fn active_power_info() -> Option<(String, String, bool)> {
+    let g = active_power_scheme()?;
+    let label = power_label(&g).unwrap_or_else(|| g.clone());
+    let l = label.to_lowercase();
+    let max = g == HIGH_PERF || g == "e9a42b02-d5df-448d-aa00-03f14749eb61" || ["ultimate", "optimal", "high perf", "élevées", "elevees", "maximal"].iter().any(|k| l.contains(k));
+    Some((g, label, max))
 }
 
 pub fn power_scheme_name(guid: &str) -> String {
-    if active_power_scheme().as_deref() == Some(guid) {
-        if let Some(l) = active_power_label() {
-            return l;
-        }
+    if let Some(l) = power_label(guid) {
+        return l;
     }
     match guid {
         HIGH_PERF => "Performances élevées".into(),
@@ -736,10 +765,19 @@ pub fn taskmgr_debugger() -> Option<String> {
     (r == 0).then(|| from_wide(&buf))
 }
 
+/// Copie inscrite dans IFEO : `%ProgramFiles%\Vigie\Vigie.exe`. Un exe sous `C:\Dev\…\dist`
+/// est modifiable sans droits admin : l'inscrire comme « débogueur » de taskmgr.exe ouvrirait une
+/// porte (n'importe quel programme pourrait le remplacer et être lancé à la place du Gestionnaire).
+pub fn taskmgr_target() -> Option<std::path::PathBuf> {
+    std::env::var_os("ProgramFiles").map(|p| std::path::PathBuf::from(p).join("Vigie").join("Vigie.exe"))
+}
+
 pub fn taskmgr_replaced() -> bool {
     let Some(d) = taskmgr_debugger() else { return false };
-    let Ok(me) = std::env::current_exe() else { return false };
-    d.trim_matches('"').eq_ignore_ascii_case(&me.to_string_lossy())
+    let d = d.trim_matches('"').to_string();
+    let target = taskmgr_target().map(|t| t.to_string_lossy().into_owned()).unwrap_or_default();
+    let me = std::env::current_exe().map(|m| m.to_string_lossy().into_owned()).unwrap_or_default();
+    d.eq_ignore_ascii_case(&target) || d.eq_ignore_ascii_case(&me)
 }
 
 /// Écrit/efface la clé (admin requis : appelé par une instance relancée avec `--set-taskmgr on|off`).
@@ -747,11 +785,21 @@ pub fn set_taskmgr_direct(on: bool) -> Result<(), String> {
     use windows_sys::Win32::System::Registry::*;
     let r = unsafe {
         if on {
+            // copie dans Program Files (dossier protégé), et c'est ce chemin-là qui est inscrit
             let me = std::env::current_exe().map_err(|e| e.to_string())?;
-            let v = wide(&format!("\"{}\"", me.display()));
+            let target = taskmgr_target().ok_or("ProgramFiles introuvable")?;
+            std::fs::create_dir_all(target.parent().unwrap()).map_err(|e| format!("Program Files : {e}"))?;
+            if !me.eq(&target) {
+                std::fs::copy(&me, &target).map_err(|e| format!("copie vers {} : {e}", target.display()))?;
+            }
+            let v = wide(&format!("\"{}\"", target.display()));
             RegSetKeyValueW(HKEY_LOCAL_MACHINE, wide(IFEO).as_ptr(), wide("Debugger").as_ptr(), REG_SZ, v.as_ptr().cast(), (v.len() * 2) as u32)
         } else {
             let r = RegDeleteKeyValueW(HKEY_LOCAL_MACHINE, wide(IFEO).as_ptr(), wide("Debugger").as_ptr());
+            if let Some(t) = taskmgr_target() {
+                let _ = std::fs::remove_file(&t);
+                let _ = std::fs::remove_dir(t.parent().unwrap());
+            }
             if r == 2 { 0 } else { r }
         }
     };
@@ -765,7 +813,14 @@ pub fn set_taskmgr(on: bool) -> Result<(), String> {
     if !run_elevated(if on { "--set-taskmgr on" } else { "--set-taskmgr off" }, true) {
         return Err("autorisation administrateur refusée".into());
     }
-    if taskmgr_replaced() == on { Ok(()) } else { Err("la modification n’a pas été appliquée".into()) }
+    // Vérification vue de l'instance non élevée (et éventuellement virtualisée) : la clé HKLM et
+    // la copie dans Program Files doivent être réelles, pas redirigées.
+    let copie = taskmgr_target().map(|t| t.is_file()).unwrap_or(false);
+    match (taskmgr_replaced() == on, !on || copie) {
+        (true, true) => Ok(()),
+        (false, _) => Err("la modification n’a pas été appliquée".into()),
+        (true, false) => Err("clé écrite mais la copie dans Program Files est introuvable".into()),
+    }
 }
 
 // ---------- Icônes des exe ----------
@@ -858,6 +913,19 @@ pub fn run_hidden(exe: &str, args: &[&str]) -> Result<String, String> {
     }
 }
 
+/// Un jeu ou une app tourne en plein écran (D3D exclusif, ou mode « occupé » / présentation) :
+/// Vigie se comporte alors comme une fenêtre réduite (mesures espacées, aucune image).
+pub fn fullscreen_app() -> bool {
+    use windows_sys::Win32::UI::Shell::{QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState};
+    let mut st = 0;
+    (unsafe { SHQueryUserNotificationState(&mut st) } == 0) && matches!(st, QUNS_BUSY | QUNS_RUNNING_D3D_FULL_SCREEN | QUNS_PRESENTATION_MODE)
+}
+
+/// `%APPDATA%` (Roaming) sans dépendance supplémentaire.
+pub fn appdata() -> Option<std::path::PathBuf> {
+    std::env::var_os("APPDATA").map(std::path::PathBuf::from)
+}
+
 pub fn current_session() -> u32 {
     let mut s = 0u32;
     unsafe { windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId(th::GetCurrentProcessId(), &mut s) };
@@ -879,22 +947,25 @@ mod action_tests {
     use super::*;
     #[test]
     fn suspend_priority_kill() {
+        let _verrou = crate::TEST_PROCESSUS.lock().unwrap_or_else(|e| e.into_inner());
         let mut child = std::process::Command::new("ping").args(["-n", "30", "127.0.0.1"]).stdout(std::process::Stdio::null()).spawn().unwrap();
         let pid = child.id();
         std::thread::sleep(std::time::Duration::from_millis(300));
-        suspend(pid, true).unwrap();
+        let ct = query_processes(&mut Vec::new()).into_iter().find(|r| r.pid == pid).unwrap().create_time;
+        suspend(pid, ct, true).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(100));
         let mut buf = Vec::new();
         let r = query_processes(&mut buf).into_iter().find(|r| r.pid == pid).unwrap();
         assert!(r.suspended, "devrait être suspendu");
-        suspend(pid, false).unwrap();
-        set_priority(pid, Prio::BelowNormal).unwrap();
+        suspend(pid, ct, false).unwrap();
+        set_priority(pid, ct, Prio::BelowNormal).unwrap();
+        assert!(kill(pid, ct + 1).is_err(), "un PID réutilisé doit être refusé");
         let r = query_processes(&mut buf).into_iter().find(|r| r.pid == pid).unwrap();
         assert!(!r.suspended);
         assert_eq!(Prio::from_base(r.base_prio), Prio::BelowNormal);
         assert!(process_path(pid).unwrap().to_lowercase().ends_with("ping.exe"));
         assert!(process_cmdline(pid).unwrap().contains("127.0.0.1"));
-        kill(pid).unwrap();
+        kill(pid, ct).unwrap();
         assert!(child.wait().is_ok());
     }
 }
@@ -903,15 +974,17 @@ mod action_tests {
 mod trim_tests {
     #[test]
     fn trim_frees_working_set() {
+        let _verrou = crate::TEST_PROCESSUS.lock().unwrap_or_else(|e| e.into_inner());
         // un processus qui touche ~100 Mo puis attend
         let mut child = std::process::Command::new("powershell")
             .args(["-NoProfile", "-Command", "$b = New-Object byte[] 100000000; for($i=0;$i -lt $b.Length;$i+=4096){$b[$i]=1}; Start-Sleep 20"])
             .spawn()
             .unwrap();
         std::thread::sleep(std::time::Duration::from_secs(4));
-        let freed = super::trim(child.id()).unwrap();
+        let ct = super::query_processes(&mut Vec::new()).into_iter().find(|r| r.pid == child.id()).unwrap().create_time;
+        let freed = super::trim(child.id(), ct).unwrap();
         eprintln!("libéré {} Mo", freed >> 20);
-        let _ = super::kill(child.id());
+        let _ = super::kill(child.id(), ct);
         let _ = child.wait();
         assert!(freed > 50 << 20);
     }
@@ -921,15 +994,17 @@ mod trim_tests {
 mod reveil_tests {
     #[test]
     fn trim_then_prefetch() {
+        let _verrou = crate::TEST_PROCESSUS.lock().unwrap_or_else(|e| e.into_inner());
         let mut child = std::process::Command::new("powershell")
             .args(["-NoProfile", "-Command", "$b = New-Object byte[] 100000000; for($i=0;$i -lt $b.Length;$i+=4096){$b[$i]=1}; Start-Sleep 20"])
             .spawn()
             .unwrap();
         std::thread::sleep(std::time::Duration::from_secs(4));
-        let freed = super::trim(child.id()).unwrap();
-        let asked = super::prefetch(child.id()).unwrap();
+        let ct = super::query_processes(&mut Vec::new()).into_iter().find(|r| r.pid == child.id()).unwrap().create_time;
+        let freed = super::trim(child.id(), ct).unwrap();
+        let asked = super::prefetch(child.id(), ct).unwrap();
         eprintln!("veille {} Mo, préchargement demandé {} Mo", freed >> 20, asked >> 20);
-        let _ = super::kill(child.id());
+        let _ = super::kill(child.id(), ct);
         let _ = child.wait();
         assert!(asked > 90 << 20);
     }

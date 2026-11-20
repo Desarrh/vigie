@@ -1245,24 +1245,23 @@ impl App {
                         ui.add_space(12.0);
                     }
                 }
-                // plus gros consommateurs
-                ui.columns(2, |c| {
-                    let top = |ui: &mut Ui, title: &str, by: &dyn Fn(&Proc) -> f64, fmt: &dyn Fn(&Proc) -> String, acts: &mut Vec<Action>| {
-                        section(ui, &p, title);
-                        let mut v: Vec<&Proc> = snap.procs.iter().filter(|x| x.key.pid > 4).collect();
-                        v.sort_by(|a, b| by(b).partial_cmp(&by(a)).unwrap_or(std::cmp::Ordering::Equal));
-                        for pr in v.into_iter().take(6) {
-                            ui.horizontal(|ui| {
-                                if ui.link(&*pr.name).clicked() {
-                                    acts.push(Action::Select(pr.key));
-                                }
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(RichText::new(fmt(pr)).color(p.muted)));
-                            });
+                // plus gros consommateurs : le top 5 de la dernière mesure (déjà calculé par la boîte noire)
+                if let Some(mo) = self.blackbox.back().cloned() {
+                    ui.columns(2, |c| {
+                        for (col, title, m) in [(0usize, "Plus gros en mémoire", Metric::Mem), (1, "Plus gros en processeur", Metric::Cpu)] {
+                            let ui = &mut c[col];
+                            section(ui, &p, title);
+                            for cu in mo.list(m) {
+                                ui.horizontal(|ui| {
+                                    if ui.link(&cu.name).clicked() {
+                                        acts.push(Action::Select(cu.key));
+                                    }
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(RichText::new(fmt_metric(m, cu.value)).color(p.muted)));
+                                });
+                            }
                         }
-                    };
-                    top(&mut c[0], "Plus gros en mémoire", &|x| x.mem as f64, &|x| human_bytes(x.mem), &mut acts);
-                    top(&mut c[1], "Plus gros en processeur", &|x| x.cpu as f64, &|x| pct(x.cpu), &mut acts);
-                });
+                    });
+                }
             });
         });
         self.actions.extend(acts);
@@ -1368,7 +1367,7 @@ impl App {
             // lu une fois à l'ouverture de la fenêtre (powercfg), pas à chaque image
             let (cur, max) = ui.ctx().memory_mut(|m| {
                 m.data.get_temp_mut_or_insert_with(egui::Id::new("power_label"), || {
-                    (sys::active_power_label().unwrap_or_default(), sys::active_power_is_max())
+                    sys::active_power_info().map(|(_, l, m)| (l, m)).unwrap_or_default()
                 })
                 .clone()
             });
@@ -1812,25 +1811,13 @@ impl App {
         }
         let list = self.startup.clone().unwrap_or_default();
         // RAM actuelle de chaque app (processus lancés depuis le même exe)
-        // même exe, ou exe du même nom sous le dossier du lanceur (Discord : Discord/app-1.0/Discord.exe)
-        let paths: Vec<(String, u64)> = self.snap.as_ref().map(|s| s.procs.iter().filter_map(|p| p.path.as_ref().map(|x| (x.to_lowercase(), p.mem))).collect()).unwrap_or_default();
-        let mut ram: std::collections::HashMap<String, (u64, usize)> = std::collections::HashMap::new();
-        for e in &list {
-            let Some(exe) = &e.exe else { continue };
-            let pe = std::path::Path::new(exe);
-            let (dir, file) = (pe.parent().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default(), pe.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default());
-            let mut acc = (0u64, 0usize);
-            for (path, mem) in &paths {
-                let same = path == exe || (!dir.is_empty() && path.starts_with(&format!("{dir}\\")) && path.ends_with(&format!("\\{file}")));
-                if same {
-                    acc.0 += mem;
-                    acc.1 += 1;
-                }
-            }
-            if acc.1 > 0 {
-                ram.insert(exe.clone(), acc);
+        // table calculée à la réception de la mesure (pas à chaque image)
+        if self.startup_ram.is_empty() {
+            if let Some(snap) = &self.snap {
+                self.startup_ram = crate::startup::ram_table(&list, &snap.procs);
             }
         }
+        let ram = self.startup_ram.clone();
         let mut acts = Vec::new();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             Frame::new().inner_margin(Margin::symmetric(24, 18)).show(ui, |ui| {

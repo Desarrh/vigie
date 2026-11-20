@@ -71,6 +71,8 @@ pub struct Snapshot {
     pub ncpu: u32,
     /// détail du coût de la mesure
     pub parts: String,
+    /// une app était en plein écran (jeu, vidéo) : mesure allégée, pas d'image à dessiner
+    pub fullscreen: bool,
 }
 
 /// Intervalle de mesure quand la fenêtre est réduite.
@@ -115,15 +117,17 @@ fn run(rx: Receiver<Cmd>, mut interval: Duration, mut gpu: bool, out: impl Fn(Ar
     let mut cache: HashMap<Key, Cached> = HashMap::new();
     let mut last_t = Instant::now();
     let mut last_sys = sys::system_times();
-    let mut background = false;
+    let mut background_cmd = false;
     let mut tick: u64 = 0;
-    let mut ports: HashMap<u32, Vec<Port>> = HashMap::new();
-    let mut ports_arc: HashMap<u32, Arc<[Port]>> = HashMap::new();
+    let mut ports: HashMap<u32, Arc<[Port]>> = HashMap::new();
     let empty_ports: Arc<[Port]> = Arc::from(Vec::new());
     let mut names: HashMap<String, Arc<str>> = HashMap::new();
     let mut last_pdh = crate::pdh::Sample::default();
     loop {
         let t0 = Instant::now();
+        // jeu / vidéo en plein écran : même régime que la fenêtre réduite
+        let fullscreen = sys::fullscreen_app();
+        let background = background_cmd || fullscreen;
         let raws = sys::query_processes(&mut buf);
         let t_procs = t0.elapsed();
         let now = Instant::now();
@@ -138,8 +142,7 @@ fn run(rx: Receiver<Cmd>, mut interval: Duration, mut gpu: bool, out: impl Fn(Ar
         let wins = sys::windows();
         let t_wins = t0.elapsed();
         if !background || tick % 3 == 0 {
-            ports = sys::ports();
-            ports_arc = ports.iter().map(|(k, v)| (*k, Arc::from(v.clone()))).collect();
+            ports = sys::ports().into_iter().map(|(k, v)| (k, Arc::from(v))).collect();
         }
         let t_ports = t0.elapsed();
         // En arrière-plan (fenêtre réduite) : pas de compteurs PDH (GPU, disque, réseau ≈ 2,6 ms),
@@ -212,7 +215,7 @@ fn run(rx: Receiver<Cmd>, mut interval: Duration, mut gpu: bool, out: impl Fn(Ar
                 gpu: pdhs.gpu.get(&r.pid).copied().unwrap_or(0.0),
                 gpu_mem: gm,
                 window: wins.get(&r.pid).map(|s| Arc::from(s.as_str())),
-                ports: ports_arc.get(&r.pid).cloned().unwrap_or_else(|| empty_ports.clone()),
+                ports: ports.get(&r.pid).cloned().unwrap_or_else(|| empty_ports.clone()),
                 idle_secs: now.duration_since(last_active).as_secs_f32(),
                 age_secs: ((now_ft - r.create_time).max(0) as f64 / 1e7) as f32,
                 idle_min: never,
@@ -248,9 +251,8 @@ fn run(rx: Receiver<Cmd>, mut interval: Duration, mut gpu: bool, out: impl Fn(Ar
             ms(t_pdh - t_ports),
             cost_ms - ms(t_pdh)
         );
-        out(Arc::new(Snapshot { procs, totals, cost_ms, ncpu, parts }));
+        out(Arc::new(Snapshot { procs, totals, cost_ms, ncpu, parts, fullscreen }));
         tick += 1;
-        let _ = &ports;
 
         // Attente jusqu'à la prochaine mesure — ou une commande.
         // réduite : une mesure toutes les 10 s au plus (CPU ≈ 0 au repos, règle 1)
@@ -272,8 +274,8 @@ fn run(rx: Receiver<Cmd>, mut interval: Duration, mut gpu: bool, out: impl Fn(Ar
                     break;
                 }
                 Ok(Cmd::Background(b)) => {
-                    let was = background;
-                    background = b;
+                    let was = background_cmd;
+                    background_cmd = b;
                     if was && !b {
                         break;
                     }
