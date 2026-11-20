@@ -526,8 +526,10 @@ impl App {
             if std::env::var_os("VIGIE_BB").is_some() {
                 self.bb_pin = Some((crate::qol::Metric::Mem, 0));
             }
-            if std::env::var_os("VIGIE_PALETTE").is_some() {
-                self.palette.open();
+            if let Some(q) = std::env::var_os("VIGIE_PALETTE") {
+                // socle 0.1.3 : saisie pré-remplie (« 1 » = palette vide)
+                let q = q.to_string_lossy().into_owned();
+                if q == "1" { self.palette.open() } else { self.palette.open_with(q) }
             }
         }
         // V4 boîte noire, V2 projets, V3 pics des jeux (tout depuis l'instantané, ~µs)

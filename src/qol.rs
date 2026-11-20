@@ -169,6 +169,8 @@ pub struct GamePeak {
     pub peak: u64,
     /// dernière fois vu (secondes Unix)
     pub seen: u64,
+    /// chemin complet de l'exe (pour retrouver un jeu par son dossier d'installation)
+    pub path: String,
 }
 
 /// Dossiers où vivent les jeux (Steam, Epic, GOG, Riot, EA, Ubisoft, Xbox, Battle.net…).
@@ -231,7 +233,11 @@ pub fn track_games(snap: &Snapshot, peaks: &mut HashMap<String, GamePeak>, desc:
                 stack.push(c.key);
             }
         }
-        let e = peaks.entry(game_key(path)).or_insert_with(|| GamePeak { name: desc(path).unwrap_or_else(|| p.name.trim_end_matches(".exe").to_string()), peak: 0, seen: now });
+        let e = peaks.entry(game_key(path)).or_insert_with(|| GamePeak { name: desc(path).unwrap_or_else(|| p.name.trim_end_matches(".exe").to_string()), peak: 0, seen: now, path: String::new() });
+        if e.path != path {
+            e.path = path.to_string();
+            changed = true;
+        }
         if ram > e.peak {
             e.peak = ram;
             changed = true;
@@ -242,6 +248,21 @@ pub fn track_games(snap: &Snapshot, peaks: &mut HashMap<String, GamePeak>, desc:
         }
     }
     changed
+}
+
+/// Jeu connu pour `arg` : nom ou chemin d'un exe, ou **dossier d'installation** (le plus gros pic
+/// parmi les exe connus sous ce dossier, ex. `J:\SteamLibrary\steamapps\common\Cyberpunk 2077`).
+/// Renvoie (clé de l'exe, pic).
+pub fn find_game<'a>(peaks: &'a HashMap<String, GamePeak>, arg: &str) -> Option<(&'a String, &'a GamePeak)> {
+    let k = game_key(arg);
+    if let Some(e) = peaks.get_key_value(&k).or_else(|| peaks.get_key_value(&format!("{k}.exe"))) {
+        return Some(e);
+    }
+    let dir = arg.trim().trim_end_matches(['\\', '/']).replace('/', "\\").to_lowercase() + "\\";
+    if dir.len() < 4 {
+        return None;
+    }
+    peaks.iter().filter(|(_, g)| g.path.to_lowercase().starts_with(&dir)).max_by_key(|(_, g)| g.peak)
 }
 
 /// Ce qu'il manque pour jouer : pic du jeu − RAM disponible (0 si ça passe).
@@ -259,6 +280,16 @@ mod tests {
         assert_eq!(project_of(r"c:\dev\vigie\target\release\vigie.exe", r"C:\Dev"), Some(("vigie".into(), r"C:\Dev\vigie".into())));
         assert_eq!(project_of(r"C:\Windows\explorer.exe", r"C:\Dev"), None);
     }
+    #[test]
+    fn jeu_par_dossier() {
+        let mut m = HashMap::new();
+        m.insert("cyberpunk2077.exe".to_string(), GamePeak { name: "Cyberpunk 2077".into(), peak: 9 << 30, seen: 1, path: r"J:\SteamLibrary\steamapps\common\Cyberpunk 2077\bin\x64\Cyberpunk2077.exe".into() });
+        m.insert("redprelauncher.exe".to_string(), GamePeak { name: "x".into(), peak: 1 << 20, seen: 1, path: r"J:\SteamLibrary\steamapps\common\Cyberpunk 2077\REDprelauncher.exe".into() });
+        assert_eq!(find_game(&m, r"j:\steamlibrary\steamapps\common\cyberpunk 2077\").map(|(k, _)| k.as_str()), Some("cyberpunk2077.exe"));
+        assert_eq!(find_game(&m, "Cyberpunk2077.exe").map(|(_, g)| g.peak), Some(9 << 30));
+        assert!(find_game(&m, r"J:\SteamLibrary\steamapps\common\Cyberpunk").is_none());
+    }
+
     #[test]
     fn jeux() {
         assert!(is_game_path(r"D:\SteamLibrary\steamapps\common\Cyberpunk 2077\bin\x64\Cyberpunk2077.exe"));

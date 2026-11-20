@@ -85,7 +85,7 @@ Vigie.exe --avant-jeu [--json]   sans fenêtre (~1,5 s) : fantômes sûrs, mise 
                                  cache vidé (si admin), plan d'alimentation ; mémorise les apps endormies
 Vigie.exe --apres-jeu [--json]   restaure le plan et réveille les apps endormies (préchargement mémoire) ; ~20 ms
 Vigie.exe --etat-dev             1 ligne JSON (format défini avec Ultimate) : serveurs de dev, Docker, WSL ; ~20–30 ms
-Vigie.exe --memoire-jeu <exe>   JSON : pic de RAM connu du jeu et ce qu'il manque maintenant (V3)
+Vigie.exe --memoire-jeu <exe|dossier>  JSON : pic de RAM connu du jeu (ou du plus gros exe sous le dossier) et ce qu'il manque (V3)
 Vigie.exe --couper-dev [--serveurs] [--docker] [--wsl] [--json]
                                  arrête tout (ou ce qui est précisé), sans UAC ; résumé d'une ligne (JSON avec --json)
 ```

@@ -361,9 +361,9 @@ fn main() {
         let s = app::Settings::load();
         let m = sys::memory();
         let avail = m.avail;
-        let g = s.game_peaks.get(&qol::game_key(&jeu)).or_else(|| s.game_peaks.get(&format!("{}.exe", qol::game_key(&jeu))));
-        let v = match g {
-            Some(g) => serde_json::json!({"v": 1, "connu": true, "nom": g.name, "pic_mo": g.peak >> 20, "disponible_mo": avail >> 20, "manque_mo": qol::missing(g.peak, avail) >> 20}),
+        // nom ou chemin d'exe, ou dossier d'installation (plus gros pic connu sous ce dossier)
+        let v = match qol::find_game(&s.game_peaks, &jeu) {
+            Some((exe, g)) => serde_json::json!({"v": 1, "connu": true, "nom": g.name, "exe": exe, "chemin": g.path, "pic_mo": g.peak >> 20, "disponible_mo": avail >> 20, "manque_mo": qol::missing(g.peak, avail) >> 20}),
             None => serde_json::json!({"v": 1, "connu": false, "disponible_mo": avail >> 20}),
         };
         println!("{v}");

@@ -5,7 +5,7 @@
 Vigie est le gestionnaire de tâches Windows de l'utilisateur. Il remplace le Gestionnaire des tâches de Windows (option Ctrl+Maj+Échap) et intègre un **chasseur de RAM fantôme** : il repère ce qui tourne pour rien (serveurs de dev oubliés, orphelins, apps cachées, Docker/WSL) et propose de le nettoyer, surtout avant de jouer.
 
 Principes :
-- **Légèreté mesurée** (socle v0.1.2, fenêtre de test invisible qui dessine vraiment, `scratchpad/mesure.ps1`, 60 s au repos) : **fenêtre ouverte** 34,5 Mo privés, 1,5 % d'un cœur (une mesure + une image par seconde) ; **fenêtre réduite** 13 Mo, **0,10 % d'un cœur** (une mesure toutes les 10 s, sans compteurs PDH, aucune image). Exe ~5,8 Mo.
+- **Légèreté mesurée** (socle v0.1.3, fenêtre de test invisible qui dessine vraiment, `scratchpad/mesure.ps1`, 60 s au repos) : **fenêtre ouverte** 34,8 Mo privés (47,8 Mo avec le socle v0.1.2 : la police emoji pesait 13 Mo), 1 à 2 % d'un cœur selon la charge (une mesure + une image par seconde) ; **fenêtre réduite** 1,5 Mo privés / 9,3 Mo de plage de travail, **0,03 % d'un cœur** (une mesure toutes les 10 s, sans compteurs PDH, aucune image). Exe ~5,8 Mo.
 - **Zéro coût fermé** : pas de service, de tray ni de démarrage auto.
 - **Rien n'est redessiné sans raison** : l'interface attend une mesure ou une action.
 - **Prudence** : rien n'est tué sans confirmation ou case cochée. Liste de processus protégés. Services et session 0 jamais proposés.
@@ -14,7 +14,7 @@ Principes :
 ## 2. Stack
 
 - **Langage** : Rust, édition 2024 (rustc 1.99). Crate `vigie` v0.1.0.
-- **Socle commun** : crate `socle` (tag v0.1.2, `https://github.com/Desarrh/socle`), features `ui`, `settings`, `crash`, `instance`, `testmode` : thème, icônes vectorielles, palette Ctrl+K, autocomplétion floue, toasts, raccourcis AZERTY, instance unique, journal de plantage, mode test. En local, `.cargo/config.toml` (non versionné) le remplace par `../socle`.
+- **Socle commun** : crate `socle` (tag v0.1.3, `https://github.com/Desarrh/socle`, polices par défaut : ni gras ni emoji), features `ui`, `settings`, `crash`, `instance`, `testmode` : thème, icônes vectorielles, palette Ctrl+K, autocomplétion floue, toasts, raccourcis AZERTY, instance unique, journal de plantage, mode test. En local, `.cargo/config.toml` (non versionné) le remplace par `../socle`.
 - **Interface** : `egui` 0.37.0, `egui-winit` 0.37.0 (clipboard, links), `winit` 0.30.13.
 - **Rendu CPU** : `softbuffer` 0.4.8 (présentation GDI), `hdrshot-egui-backend` 0.2.0 (rastériseur logiciel, importé comme `egui_software_backend`), `bytemuck` 1. Il n'y a **aucun contexte GPU**.
 - **Données** : `serde` 1 + `serde_json` 1 (réglages, journal, sortie `docker`), `image` 0.25.10 (PNG seulement : icône, captures de debug), `dirs` 7.0.0.
@@ -183,8 +183,8 @@ Elle vient du **socle** (`socle::theme`, `socle::icons`, `socle::ui`) depuis la 
 - `--set-taskmgr on|off` : instance élevée éphémère qui écrit la clé IFEO.
 - `--avant-jeu` / `--apres-jeu` (`--json` en option) : sans fenêtre. `--apres-jeu` n'ouvre ni egui ni thread de mesure (~20 ms).
 - `--etat-dev` (1 ligne JSON `{"v":1,"items":[{kind,label,pids,ram_mo,…}],"total_mo"}`, format défini avec Ultimate, ~20–30 ms) et `--couper-dev [--serveurs] [--docker] [--wsl] [--json]` (résumé d'une ligne, sans UAC) : garde-fou dev T2 (`src/cli.rs`, exemples dans le README). Ne touche jamais un arbre avec fenêtre visible, l'appelant et ses ancêtres, Ultimate.exe.
-- Ressource de version `VigieCli` = « avant-jeu apres-jeu etat-dev couper-dev memoire-jeu » (`build.rs`) : Ultimate y vérifie les commandes comprises avant de les appeler. **Toute nouvelle commande sans fenêtre doit y être ajoutée.**
-- `--memoire-jeu <exe>` : `{"v":1,"connu":true,"nom","pic_mo","disponible_mo","manque_mo"}` (V3).
+- Ressource de version `VigieCli` = « avant-jeu apres-jeu etat-dev couper-dev memoire-jeu memoire-jeu-dossier » (`build.rs`) : Ultimate y vérifie les commandes comprises avant de les appeler. **Toute nouvelle commande sans fenêtre doit y être ajoutée.**
+- `--memoire-jeu <exe | dossier d'installation>` : `{"v":1,"connu":true,"nom","exe","chemin","pic_mo","disponible_mo","manque_mo"}` (V3) ; avec un dossier, le plus gros pic connu sous ce dossier (marqueur `memoire-jeu-dossier`).
 - `%APPDATA%\Vigie\veille.json` : apps endormies par `--avant-jeu`, consommé par `--apres-jeu`.
 
 **Debug / tests** (règle n°0 : ne jamais déranger l'utilisateur) : `VIGIE_CAPTURE=x.png` rend l'interface hors écran sans créer de fenêtre (egui + rendu logiciel dans un tampon, priorité basse), options `VIGIE_VIEW`, `VIGIE_SELECT`, `VIGIE_PALETTE`, `VIGIE_GAME`, `VIGIE_BB`, `VIGIE_SIZE`, `VIGIE_DUMP`. `VIGIE_DATA_DIR` redirige réglages, journal et veille.json vers un dossier de test.
