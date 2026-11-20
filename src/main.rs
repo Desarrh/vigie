@@ -64,7 +64,8 @@ impl Runner {
         let size = gfx.window.inner_size();
         let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else { return };
         let t0 = Instant::now();
-        let raw = gfx.egui.take_egui_input(&gfx.window);
+        let mut raw = gfx.egui.take_egui_input(&gfx.window);
+        socle::testmode::prepare_input(&mut raw); // sans effet hors mode test
         let out = self.ctx.run_ui(raw, |ui| {
             app.tick();
             app.handle_keys(ui.ctx());
