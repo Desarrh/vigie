@@ -454,7 +454,7 @@ mod couper_tests {
             cpu_time: 0,
             private_ws: 50 << 20,
             commit: 0,
-            peak_commit: 0,
+            peak_ws: 0,
             ws: 50 << 20,
             io_read: 0,
             io_write: 0,

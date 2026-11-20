@@ -108,8 +108,8 @@ pub struct Raw {
     pub private_ws: u64,
     /// mémoire engagée (privée)
     pub commit: u64,
-    /// pic de mémoire engagée privée tenu par le noyau depuis le lancement du processus
-    pub peak_commit: u64,
+    /// pic de mémoire résidente (plage de travail) tenu par le noyau depuis le lancement
+    pub peak_ws: u64,
     pub ws: u64,
     pub io_read: u64,
     pub io_write: u64,
@@ -169,7 +169,7 @@ pub fn query_processes(buf: &mut Vec<u8>) -> Vec<Raw> {
             cpu_time: p.UserTime + p.KernelTime,
             private_ws: p.WorkingSetPrivateSize.max(0) as u64,
             commit: p.PrivatePageCount as u64,
-            peak_commit: p.PeakPagefileUsage as u64,
+            peak_ws: p.PeakWorkingSetSize as u64,
             ws: p.WorkingSetSize as u64,
             io_read: p.ReadTransferCount.max(0) as u64,
             io_write: p.WriteTransferCount.max(0) as u64,

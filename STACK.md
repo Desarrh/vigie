@@ -42,10 +42,16 @@ Le Gestionnaire des tâches de Windows montre ce qui tourne, mais il ne dit pas 
   - Suppr, Maj+Suppr, « Terminer tous les X » et `:port` puis Suppr dans la palette ouvrent une confirmation (réglable : « Confirmer avant de terminer » est activé par défaut) ;
   - les cases « sûr » sont pré-cochées, mais rien ne part sans le clic sur « Nettoyer ».
 - **Ligne de commande** : `--avant-jeu` et `--couper-dev` agissent sans confirmer. C'est l'appelant (Ultimate) qui doit montrer la liste à l'utilisateur. `--couper-dev --seulement <clés>` garantit qu'on ne coupe que ce qui a été montré (§5).
-- **Toujours** :
-  - jamais un processus vital (`CRITICAL`), protégé (`PROTECTED`), un agent IA (Claude Code, Claude, Copilot, Codex : `hunter::is_ai_cmd`), Vigie ni la chaîne de processus qui l'a lancée (`qol::ancestors`) ;
-  - jamais un arbre qui a une fenêtre visible, y compris sur un autre bureau virtuel ;
-  - même liste d'intouchables pour le chasseur, la sieste et `--couper-dev`.
+- **Toujours**, avec des règles communes (`PROTECTED`, `hunter::is_ai_cmd` pour Claude Code, Claude, Copilot et Codex, `qol::ancestors` pour Vigie et la chaîne qui l'a lancée) appliquées par trois chemins :
+
+  | Chemin | Ce qui est vérifié |
+  |---|---|
+  | Chasseur (`hunter::hunt`) | arbre entier : pas de fenêtre visible, aucun processus `PROTECTED`, pas d'agent IA, pas d'ancêtre de Vigie |
+  | Sieste (`qol::projects`) | le processus et ses descendants sans fenêtre, aucun ancêtre fenêtré du même projet, pas `PROTECTED`, pas d'agent IA, pas d'ancêtre de Vigie |
+  | `--couper-dev` (`cli::Vue::interdit`) | arbre entier : pas de fenêtre, pas `PROTECTED` (sauf la console attachée), pas Ultimate.exe ni Vigie (`JAMAIS`), pas d'ancêtre de l'appelant, pas d'agent IA |
+  | Toute action de terminer (`app`, `travail`) | refus des processus vitaux (`CRITICAL` : leur arrêt provoque un écran bleu ou une déconnexion) et de Vigie elle-même |
+
+  « Fenêtre visible » inclut une fenêtre sur un autre bureau virtuel. Une seule fonction de garde commune à ces chemins est notée en dette (§10).
 - **Avant chaque action sur un PID** (terminer, suspendre, priorité, mise en veille, préchargement) : la date de création est revérifiée (`GetProcessTimes` comparée à `Key::ctime`). Un PID réutilisé par un autre processus est refusé.
 - Suspendre et endormir relisent l'état réel juste avant d'agir (`sys::suspended_now`) : les suspensions ne s'empilent pas.
 
@@ -59,7 +65,7 @@ Le Gestionnaire des tâches de Windows montre ce qui tourne, mais il ne dit pas 
 - **Interface** : `egui` 0.37, `egui-winit` 0.37 (clipboard, links), `winit` 0.30.13.
 - **Rendu CPU** : `softbuffer` 0.4.8 (présentation GDI), `hdrshot-egui-backend` 0.2.0 (rastériseur logiciel, importé comme `egui_software_backend`), `bytemuck`. Aucun contexte GPU.
 - **Données** : `serde` + `serde_json` (réglages, journal, sortie Docker), `image` 0.25 (PNG seulement : icône, captures de test). `%APPDATA%` est lu directement.
-- **API Windows** : `windows-sys` 0.61.2, plus `ntdll` déclaré à la main. Features de `windows-sys` utilisées :
+- **API Windows** : `windows-sys` 0.61.2 (liste des features dans `Cargo.toml`), plus `ntdll` déclaré à la main. Principaux appels :
   - **ntdll** : `NtQuerySystemInformation` (classe 5 = processus et pics noyau, classe 80 = listes mémoire, admin), `NtSetSystemInformation` (purge du cache), `NtQueryInformationProcess` (ligne de commande, classe 60), `NtSuspendProcess` / `NtResumeProcess` ;
   - **Threading** : `OpenProcess`, `GetProcessTimes`, `TerminateProcess`, `SetPriorityClass`, `QueryFullProcessImageNameW`, `GetSystemTimes` ;
   - **Memory / ProcessStatus** : `VirtualQueryEx`, `PrefetchVirtualMemory`, `K32EmptyWorkingSet`, `K32GetProcessMemoryInfo` ;
@@ -80,11 +86,11 @@ Le Gestionnaire des tâches de Windows montre ce qui tourne, mais il ne dit pas 
 
 | Choix | Alternatives écartées | Raison |
 |---|---|---|
-| Rendu CPU (softbuffer) | egui sur wgpu ou OpenGL | Un contexte GPU coûte environ 150 Mo de pilote (mesuré sur l'Explorateur, de 160 à 40 Mo). Vigie ne doit jamais réveiller le GPU pendant un jeu. |
+| Rendu CPU (softbuffer) | egui sur wgpu ou OpenGL | Un contexte GPU coûte environ 120 Mo de pilote (mesuré sur l'Explorateur : de 160 à 40 Mo sans lui). Vigie ne doit jamais réveiller le GPU pendant un jeu. |
 | egui (via le socle) | Win32 natif, Tauri | Même interface et mêmes composants que les autres applis maison. Tauri apporterait WebView2 (plus de 100 Mo). |
 | `NtQuerySystemInformation` (une lecture pour tous les processus) | Toolhelp + `OpenProcess` par processus, WMI | Une seule lecture noyau (~3 à 8 ms pour ~370 processus) donne CPU, mémoire, E/S, threads, état suspendu et pics. WMI coûte des dizaines de ms et un service. |
 | PDH pour le GPU | D3DKMT (`D3DKMTQueryStatistics`) | PDH donne directement le % par moteur et par PID, comme le Gestionnaire des tâches. D3DKMT est plus fin mais demande d'agréger par adaptateur et par nœud. Coût PDH ~2,6 ms par mesure, coupé en arrière-plan. |
-| `docker.exe` toutes les 20 s, seulement si Docker tourne | API du moteur sur `\\.\pipe\docker_engine` | Plus simple à écrire et déjà testé. La dépendance au PATH est notée en limites. |
+| `docker.exe` toutes les 20 s, seulement si Docker tourne | API du moteur sur `\\.\pipe\docker_engine` | Plus simple à écrire ; un processus toutes les 20 s, seulement quand Docker tourne. À rouvrir si la dépendance au PATH ou ce coût posent problème. |
 | IFEO `Debugger` sur `taskmgr.exe` | Raccourci clavier global, hook clavier | Seul moyen pour que Ctrl+Maj+Échap et tous les lancements de `taskmgr.exe` ouvrent Vigie. C'est la méthode de Process Explorer. |
 | Copie dans `%ProgramFiles%\Vigie` pour IFEO | Inscrire `dist\Vigie.exe` | `C:\Dev` est modifiable sans droits admin. Inscrire un exe modifiable laisserait n'importe quel programme remplacer ce qui se lance à la place du Gestionnaire. |
 
@@ -125,6 +131,7 @@ Les compteurs PDH sont créés **après** la première mesure (leur initialisati
 
 ### Flux de données
 - `Snapshot` → `App::on_snapshot` : historiques (120 points), boîte noire, chasseur, projets, suivi des jeux, candidats d'autocomplétion (si les processus ont changé), table RAM du Démarrage (si la vue est ouverte), relevé d'inactivité (toutes les 5 min).
+- Pic d'un jeu (V3) : max(somme de la mémoire résidente privée de l'arbre à l'instant, pic de plage de travail de la racine tenu par le noyau). Deux mesures de mémoire résidente, comparées à la RAM disponible (marge de 10 %).
 - `rebuild_rows()` ne tourne que si quelque chose a changé. Les minuscules ne sont calculées qu'une fois par mesure, et seulement si une recherche ou le tri par nom en a besoin.
 - Les actions de l'interface sont empilées (`actions`) puis appliquées après le dessin, comme dans l'Explorateur.
 
@@ -160,7 +167,7 @@ Ce qui est propre à Vigie :
 | `journal.jsonl` | Nettoyages : `tué`, `chassé`, `coupé`, `sieste`, `veille`, `cache`. 90 jours. |
 | `dernier-jeu.txt`, `crash.log` | Dernier résumé du mode jeu, plantages (socle, signalés par un toast au lancement suivant). |
 
-Lancée depuis l'app Claude (MSIX), une commande écrit ses nouveaux fichiers d'AppData dans le dossier `LocalCache` du paquet. Pour les tests, on utilise `VIGIE_DATA_DIR` sous `C:\Dev\vigie\target\` ; pour relancer la vraie Vigie, `explorer.exe "C:\Dev\vigie\dist\Vigie.exe"`.
+Les tests écrivent leurs données sous `C:\Dev\vigie\target\` avec `VIGIE_DATA_DIR` (contraintes de l'environnement de développement : [DIRECTION.md](../DIRECTION.md) §0).
 
 ### Ligne de commande
 
@@ -191,7 +198,7 @@ Lancée depuis l'app Claude (MSIX), une commande écrit ses nouveaux fichiers d'
 - Pas de `unwrap` sur les appels système : `Result<_, String>` lisible, affiché en toast rouge. Handles fermés par `Drop`.
 
 ### Tests et mesures (règle n°0)
-- `cargo test --release` : 25 tests et 1 ignoré, celui qui écrit une entrée factice dans `HKCU\…\Run`, désactivé pour ne pas toucher au registre de l'utilisateur. Les tests qui lancent des processus jetables sont sérialisés (`TEST_PROCESSUS`).
+- `cargo test --release` : 26 tests et 1 ignoré, celui qui écrit une entrée factice dans `HKCU\…\Run`, désactivé pour ne pas toucher au registre de l'utilisateur. Les tests qui lancent des processus jetables sont sérialisés (`TEST_PROCESSUS`).
 - `tools\mesure.ps1 [-reduite]` : RAM et CPU au repos, fenêtre de test invisible.
 - `--avant-jeu` et `--couper-dev` agissent sur les vraies apps : on ne les teste qu'avec des cibles factices et `VIGIE_DATA_DIR`.
 
@@ -248,7 +255,7 @@ Exe : ~5,9 Mo. La police emoji, retirée depuis le socle v0.1.3, coûtait 13 Mo.
   - à sa fermeture : `--apres-jeu --json` ;
   - garde-fou dev : `--etat-dev`, puis `--couper-dev --seulement <clés montrées>` ;
   - « Il te manque X Go » : `--memoire-jeu <dossier du jeu>`.
-  - Si Vigie est absente ou ancienne (marqueur `VigieCli`), Ultimate continue sans rien bloquer (DIRECTION.md règle 4).
+  - Si Vigie est absente ou ancienne (marqueur `VigieCli`), Ultimate continue sans rien bloquer ([DIRECTION.md](../DIRECTION.md) §2, règle 4 : chaque appli marche seule).
 
 ## 9. Risques et mitigations
 
@@ -262,7 +269,6 @@ Exe : ~5,9 Mo. La police emoji, retirée depuis le socle v0.1.3, coûtait 13 Mo.
 | Copie IFEO périmée | Ancienne version derrière Ctrl+Maj+Échap | Contrôle au lancement + toast + commande de mise à jour | En place |
 | Interruption pendant une sieste ou un mode jeu (plantage, fermeture) | Processus restés suspendus, plan non restauré | Au lancement suivant : projets affichés « endormi » avec un bouton Réveiller ; mode jeu restauré depuis `mode-jeu.json` (bouton « Quitter ») ; `--apres-jeu` fonctionne aussi plus tard | En place |
 | Plan perso performant rétrogradé | Moins de performances en jeu | « Déjà au maximum » : GUID connus, puis état minimal du processeur à 100 %, puis nom ; plan restauré en sortie | En place (un plan perso dont l'état minimal du processeur est sous 100 % sera changé, puis restauré à la sortie) |
-| Écriture virtualisée (MSIX) | Réglages invisibles pour l'utilisateur | Données de test sous `C:\Dev\vigie\target` ; relance via `explorer.exe` | En place |
 
 ## 10. Limites et dette technique
 
@@ -276,14 +282,6 @@ Exe : ~5,9 Mo. La police emoji, retirée depuis le socle v0.1.3, coûtait 13 Mo.
 - Chemins codés en dur vers l'Explorateur (`C:\Dev\explorateur`), avec un repli sur `explorer /select`.
 - Pas de mise à jour automatique (l'Explorateur en a une). Le dépôt git est local, pas encore publié.
 
-Pistes ouvertes : voir [QOL.md](../QOL.md). Propositions de Vigie pas encore reportées là-bas :
-- naissances et morts surlignées ;
-- viseur sur une fenêtre ;
-- fantômes qui reviennent ;
-- bouclier premier plan ;
-- instantané « avant / après » ;
-- qui verrouille ce fichier ;
-- mini-barres par cœur ;
-- débit réseau par processus ;
-- DLL et handles ;
-- API Docker par tube nommé.
+- Les règles d'intouchables sont communes (§1) mais assemblées par trois chemins : une seule fonction de garde (par exemple `hunter::interdit`) éviterait qu'un chemin diverge.
+
+Pistes ouvertes : [QOL.md](../QOL.md) (les propositions propres à Vigie y sont transmises par la session de coordination).

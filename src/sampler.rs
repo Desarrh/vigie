@@ -33,8 +33,8 @@ pub struct Proc {
     pub cpu_time: i64,
     pub mem: u64,
     pub commit: u64,
-    /// pic de mémoire engagée privée tenu par le noyau (pics des jeux même entre deux mesures)
-    pub peak_commit: u64,
+    /// pic de plage de travail tenu par le noyau (pics des jeux même entre deux mesures)
+    pub peak_ws: u64,
     pub ws: u64,
     pub disk: f64,
     pub gpu: f32,
@@ -225,7 +225,7 @@ fn run(rx: Receiver<Cmd>, mut interval: Duration, mut gpu: bool, out: impl Fn(Ar
                 cpu_time: r.cpu_time,
                 mem: r.private_ws,
                 commit: r.commit,
-                peak_commit: r.peak_commit,
+                peak_ws: r.peak_ws,
                 ws: r.ws,
                 disk,
                 gpu: pdhs.gpu.get(&r.pid).copied().unwrap_or(0.0),

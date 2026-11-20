@@ -12,7 +12,7 @@ cargo build --release
 target\release\vigie.exe        (ou dist\Vigie.exe)
 ```
 
-Un seul exe (~5 Mo), sans installation. Une seule fenêtre : relancer Vigie ramène celle qui est ouverte.
+Un seul exe (~5,9 Mo), sans installation. Une seule fenêtre : relancer Vigie ramène celle qui est ouverte.
 
 ## Ce qu'il fait
 

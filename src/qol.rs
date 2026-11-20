@@ -121,8 +121,31 @@ pub fn project_of(text: &str, root: &str) -> Option<(String, String)> {
 /// Exclus : processus avec une fenêtre visible (l'éditeur, le jeu…), protégés, agents IA, Vigie et ses ancêtres.
 pub fn projects(snap: &Snapshot, session: u32, root: &str, untouchable: &HashSet<Key>) -> Vec<Project> {
     let mut map: HashMap<String, Project> = HashMap::new();
+    // même règle que le chasseur : jamais un arbre qui a une fenêtre visible. Exclus : le processus
+    // s'il a une fenêtre ou si un descendant en a une, et aussi s'il descend d'un processus fenêtré
+    // du même projet (suspendre l'enfant d'une app ouverte la figerait).
+    let fenetres = arbres_fenetres(snap);
+    let by: HashMap<Key, &Proc> = snap.procs.iter().map(|p| (p.key, p)).collect();
+    let projet_de = |p: &Proc| p.path.as_deref().and_then(|x| project_of(x, root)).or_else(|| project_of(p.cmd.as_deref().unwrap_or(""), root)).map(|(n, _)| n.to_lowercase());
     for p in &snap.procs {
-        if p.session != session || p.key.pid <= 4 || p.window.is_some() || untouchable.contains(&p.key) {
+        if p.session != session || p.key.pid <= 4 || fenetres.contains(&p.key) || untouchable.contains(&p.key) {
+            continue;
+        }
+        let mien = projet_de(p);
+        let mut cur = p.parent;
+        let mut parent_fenetre = false;
+        while let Some(k) = cur {
+            let Some(q) = by.get(&k) else { break };
+            if mien.is_none() || projet_de(q) != mien {
+                break;
+            }
+            if q.window.is_some() {
+                parent_fenetre = true;
+                break;
+            }
+            cur = q.parent;
+        }
+        if parent_fenetre {
             continue;
         }
         let n = p.name.to_ascii_lowercase();
@@ -144,6 +167,17 @@ pub fn projects(snap: &Snapshot, session: u32, root: &str, untouchable: &HashSet
     let mut v: Vec<Project> = map.into_values().collect();
     v.sort_by(|a, b| b.ram.cmp(&a.ram));
     v
+}
+
+/// Processus dont l'arbre (lui-même ou un descendant) a une fenêtre visible : leurs ancêtres
+/// sont marqués en remontant depuis chaque fenêtre.
+pub fn arbres_fenetres(snap: &Snapshot) -> HashSet<Key> {
+    let by: HashMap<Key, &Proc> = snap.procs.iter().map(|p| (p.key, p)).collect();
+    let mut out = HashSet::new();
+    for p in snap.procs.iter().filter(|p| p.window.is_some()) {
+        out.extend(ancestors(Some(p.key), |k| by.get(&k).and_then(|q| q.parent)));
+    }
+    out
 }
 
 /// Vigie et toute sa chaîne de parents (ne jamais endormir celui qui nous a lancés).
@@ -246,9 +280,10 @@ pub fn track_games(snap: &Snapshot, peaks: &mut HashMap<String, GamePeak>, desc:
             e.path = path.to_string();
             changed = true;
         }
-        // le noyau garde le pic de la racine : un pic bref entre deux mesures (10 s en plein écran)
-        // n'est pas perdu. L'arbre, lui, est mesuré à l'instant (les pics des enfants ne coïncident pas).
-        let ram = ram.max(p.peak_commit);
+        // pic V3 = max(arbre mesuré à l'instant, pic de plage de travail de la racine tenu par le noyau) :
+        // un pic bref entre deux mesures (10 s en plein écran) n'est pas perdu. Deux mesures de mémoire
+        // résidente, comparables à la RAM disponible (pas de mémoire engagée, souvent bien plus haute).
+        let ram = ram.max(p.peak_ws);
         if ram > e.peak {
             e.peak = ram;
             changed = true;
@@ -352,5 +387,59 @@ mod sieste_tests {
         let _ = child.kill();
         let _ = child.wait();
         let _ = std::fs::remove_file(js);
+    }
+}
+
+#[cfg(test)]
+mod famille_tests {
+    use super::*;
+    use crate::sampler::Totals;
+    use std::sync::Arc;
+
+    fn p(pid: u32, parent: Option<u32>, fen: bool) -> Proc {
+        Proc {
+            key: Key { pid, ctime: 1 },
+            ppid: parent.unwrap_or(0),
+            parent: parent.map(|x| Key { pid: x, ctime: 1 }),
+            name: Arc::from("node.exe"),
+            path: None,
+            cmd: Some(Arc::from(r"node C:\Dev\appli\main.js")),
+            session: 1,
+            threads: 1,
+            handles: 1,
+            base_prio: 8,
+            suspended: false,
+            cpu: 0.0,
+            cpu_time: 0,
+            mem: 1 << 20,
+            commit: 0,
+            peak_ws: 0,
+            ws: 0,
+            disk: 0.0,
+            gpu: 0.0,
+            gpu_mem: 0,
+            window: fen.then(|| Arc::from("Appli")),
+            ports: Arc::from(Vec::new()),
+            idle_secs: 0.0,
+            age_secs: 0.0,
+            idle_min: false,
+        }
+    }
+
+    /// Les enfants sans fenêtre d'une app ouverte ne sont pas endormis ; un projet sans fenêtre l'est.
+    #[test]
+    fn sieste_respecte_les_fenetres_de_la_famille() {
+        let s = Snapshot {
+            procs: vec![p(10, None, true), p(11, Some(10), false), p(12, Some(11), false), p(20, None, false), p(21, Some(20), false)],
+            totals: Totals::default(),
+            cost_ms: 0.0,
+            ncpu: 1,
+            parts: String::new(),
+            fullscreen: false,
+        };
+        let pr = projects(&s, 1, r"C:\Dev", &HashSet::new());
+        let pids: Vec<u32> = pr.iter().flat_map(|x| x.keys.iter().map(|k| k.pid)).collect();
+        assert!(!pids.contains(&11) && !pids.contains(&12) && !pids.contains(&10), "{pids:?}");
+        assert!(pids.contains(&20) && pids.contains(&21), "{pids:?}");
     }
 }
