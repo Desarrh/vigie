@@ -59,7 +59,7 @@ Le Gestionnaire des tâches de Windows montre ce qui tourne, mais il ne dit pas 
 
 - **Langage** : Rust, édition 2024 (rustc 1.99). Crate `vigie` 0.1.0.
 - **Socle** :
-  - version : tag `v0.1.5`, features `ui`, `settings`, `crash`, `instance`, `testmode`, sans la feature `images` (incompatible avec `panic = "abort"`) ;
+  - version : tag `v0.1.6`, features `ui`, `settings`, `crash`, `instance`, `testmode`, sans la feature `images` (incompatible avec `panic = "abort"`) ;
   - polices : options par défaut du socle (Segoe UI, Consolas, Segoe UI Symbol ; ni gras ni emoji) ;
   - surcharge locale : `.cargo/config.toml` (non versionné) remplace le tag par `../socle`, mais seulement quand la copie locale a la même version que celle verrouillée dans `Cargo.lock`.
 - **Interface** : `egui` 0.37, `egui-winit` 0.37 (clipboard, links), `winit` 0.30.13.
