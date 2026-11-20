@@ -41,6 +41,21 @@ le Gestionnaire des tâches, les entrées « tous les utilisateurs » demandent 
 **Mettre en veille** (clic droit, ou palette) — vide la RAM d'un processus *sans le fermer* : il continue de tourner et
 relit ses pages quand il en a besoin.
 
+**Tuer par port** (V1) — dans la palette Ctrl+K, taper `:3000` : la première commande termine ce qui écoute sur ce
+port (Entrée), ou Suppr directement. Fini les « EADDRINUSE ».
+
+**Sieste de projet** (V2) — le volet latéral liste les projets en cours sous `C:\Dev\X` (processus dont l'exe ou la ligne
+de commande est dans le dossier). Un clic **endort** tout le projet (processus suspendus et RAM libérée, rien n'est fermé),
+un autre le **réveille** instantanément. Jamais touchés : processus avec fenêtre (l'éditeur), Claude Code, Vigie et ses parents.
+Aussi dans la palette (« Endormir le projet … »).
+
+**Il te manque X Go pour ce jeu** (V3) — Vigie retient le pic de RAM de chaque jeu lancé depuis Steam, Epic, GOG, Riot, EA,
+Ubisoft, Xbox… (section « Jeux » du chasseur). Le mode « avant de jouer » affiche pour le dernier jeu « ça passe » ou
+« il te manque 1,4 Go » (pic + 10 % de marge − RAM disponible).
+
+**Boîte noire** (V4) — survoler un graphique de Performances (processeur, mémoire, GPU, disque) montre les 5 coupables de cet
+instant ; un clic l'épingle sous les graphiques, même si les processus sont morts depuis.
+
 **Performances** — historique CPU, mémoire (engagée, en veille), GPU, disque, réseau ; plus gros consommateurs.
 
 **🎮 Avant de jouer** (Ctrl+G) — chasse les fantômes sûrs, met en veille les apps en arrière-plan
@@ -70,6 +85,7 @@ Vigie.exe --avant-jeu [--json]   sans fenêtre (~1,5 s) : fantômes sûrs, mise 
                                  cache vidé (si admin), plan d'alimentation ; mémorise les apps endormies
 Vigie.exe --apres-jeu [--json]   restaure le plan et réveille les apps endormies (préchargement mémoire) ; ~20 ms
 Vigie.exe --etat-dev             1 ligne JSON (format défini avec Ultimate) : serveurs de dev, Docker, WSL ; ~20–30 ms
+Vigie.exe --memoire-jeu <exe>   JSON : pic de RAM connu du jeu et ce qu'il manque maintenant (V3)
 Vigie.exe --couper-dev [--serveurs] [--docker] [--wsl] [--json]
                                  arrête tout (ou ce qui est précisé), sans UAC ; résumé d'une ligne (JSON avec --json)
 ```
@@ -115,7 +131,7 @@ Le coût détaillé s'affiche en survolant « mesure … ms » dans la barre d'�
 
 `VIGIE_CAPTURE=x.png` rend l'interface **entièrement hors écran** (aucune fenêtre, aucun focus, priorité basse) après
 quelques mesures, l'enregistre puis quitte. Options : `VIGIE_VIEW=hunter|perf|startup`, `VIGIE_SELECT=nom.exe`,
-`VIGIE_PALETTE=texte`, `VIGIE_GAME=1`, `VIGIE_SIZE=1240x780`, `VIGIE_DUMP=nom.exe` (écrit `x.png.txt`).
+`VIGIE_PALETTE=1`, `VIGIE_GAME=1`, `VIGIE_BB=1` (boîte noire épinglée), `VIGIE_SIZE=1240x780`, `VIGIE_DUMP=nom.exe` (écrit `x.png.txt`).
 
 `VIGIE_DATA_DIR=dossier` remplace `%APPDATA%\Vigie` (réglages, journal, veille.json) : les tests ne touchent jamais
 aux données de l'utilisateur. Règle commune (DIRECTION.md, règle n°0) : un test ne dérange jamais l'utilisateur —

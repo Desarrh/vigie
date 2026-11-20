@@ -92,6 +92,10 @@ pub struct Settings {
     pub prev_power: Option<String>,
     /// historique de la recherche (autocomplétion)
     pub search_history: socle::autocomplete::History,
+    /// V3 : pic de RAM de chaque jeu (clé = nom de l'exe)
+    pub game_peaks: HashMap<String, crate::qol::GamePeak>,
+    /// V2 : dossier des projets de dev
+    pub dev_root: String,
 }
 
 impl Default for Settings {
@@ -117,6 +121,8 @@ impl Default for Settings {
             game_power: true,
             prev_power: None,
             search_history: Default::default(),
+            game_peaks: HashMap::new(),
+            dev_root: r"C:\Dev".into(),
         }
     }
 }
@@ -219,6 +225,11 @@ pub enum Action {
     SetView(View),
     WebSearch(String),
     Trim(Vec<Key>),
+    /// V1 : terminer ce qui écoute sur ce port
+    KillPort(u16),
+    /// V2 : endormir / réveiller un projet (dossier)
+    SleepProject(String),
+    WakeProject(String),
     StartupToggle(usize, bool),
     StartupRefresh,
 }
@@ -281,6 +292,13 @@ pub struct App {
     pub docker: crate::docker::Shared,
     docker_running: Arc<std::sync::atomic::AtomicBool>,
     pub journal: Vec<crate::journal::Rec>,
+    /// V4 : les 5 coupables de chaque mesure de l'historique
+    pub blackbox: VecDeque<crate::qol::Moment>,
+    /// V4 : instant épinglé par un clic sur un graphique (ressource, index dans l'anneau)
+    pub bb_pin: Option<(crate::qol::Metric, usize)>,
+    /// V2 : projets en cours sous `dev_root`
+    pub projects: Vec<crate::qol::Project>,
+    peaks_saved: std::time::Instant,
 }
 
 impl App {
@@ -372,6 +390,10 @@ impl App {
             docker,
             docker_running,
             journal: crate::journal::load(30),
+            blackbox: VecDeque::new(),
+            bb_pin: None,
+            projects: Vec::new(),
+            peaks_saved: std::time::Instant::now(),
             s,
         }
     }
@@ -490,9 +512,26 @@ impl App {
             if std::env::var_os("VIGIE_GAME").is_some() {
                 self.game_dialog = true;
             }
+            if std::env::var_os("VIGIE_BB").is_some() {
+                self.bb_pin = Some((crate::qol::Metric::Mem, 0));
+            }
             if std::env::var_os("VIGIE_PALETTE").is_some() {
                 self.palette.open();
             }
+        }
+        // V4 boîte noire, V2 projets, V3 pics des jeux (tout depuis l'instantané, ~µs)
+        if self.bb_pin.is_some() && self.blackbox.len() >= HIST {
+            // l'anneau glisse : l'instant épinglé recule d'un cran
+            self.bb_pin = self.bb_pin.and_then(|(m, i)| i.checked_sub(1).map(|i| (m, i)));
+        }
+        crate::qol::push_moment(&mut self.blackbox, crate::qol::moment(&snap), HIST);
+        let untouchable = crate::qol::self_and_ancestors(&snap, self.self_pid);
+        self.projects = crate::qol::projects(&snap, self.session, &self.s.dev_root, &untouchable);
+        let icons = &self.icons;
+        let desc = |path: &str| icons.get(path).and_then(|e| e.desc.clone()).filter(|d| !d.is_empty());
+        if crate::qol::track_games(&snap, &mut self.s.game_peaks, desc) && self.peaks_saved.elapsed() > Duration::from_secs(30) && !self.headless {
+            self.s.save();
+            self.peaks_saved = std::time::Instant::now();
         }
         let mut cands: Vec<String> = Vec::with_capacity(snap.procs.len() + 32);
         for p in &snap.procs {
@@ -844,6 +883,46 @@ impl App {
                 }
                 self.sample_now();
             }
+            Action::KillPort(port) => {
+                let keys: Vec<Key> = self.snap.as_ref().map(|s| s.procs.iter().filter(|p| p.ports.iter().any(|x| x.tcp && x.port == port)).map(|p| p.key).collect()).unwrap_or_default();
+                if keys.is_empty() {
+                    self.toast(format!("Rien n’écoute sur :{port}"), true);
+                } else {
+                    self.apply(Action::Kill(keys, true));
+                }
+            }
+            Action::SleepProject(dir) => {
+                let Some(pr) = self.projects.iter().find(|p| p.dir == dir).cloned() else { return };
+                let (mut n, mut freed, mut errs) = (0, 0u64, Vec::new());
+                for k in &pr.keys {
+                    match sys::suspend(k.pid, true) {
+                        Ok(()) => {
+                            n += 1;
+                            freed += sys::trim(k.pid).unwrap_or(0);
+                        }
+                        Err(e) => errs.push(e),
+                    }
+                }
+                if n > 0 {
+                    self.log(vec![crate::journal::Rec { t: crate::journal::now(), what: "sieste".into(), name: pr.name.clone(), bytes: freed }]);
+                    self.toast(format!("Projet « {} » endormi : {n} processus suspendus, {} libérés", pr.name, human_bytes(freed)), false);
+                } else {
+                    self.toast(errs.first().cloned().unwrap_or_else(|| "rien à endormir".into()), true);
+                }
+                self.sample_now();
+            }
+            Action::WakeProject(dir) => {
+                let Some(pr) = self.projects.iter().find(|p| p.dir == dir).cloned() else { return };
+                let mut n = 0;
+                for k in &pr.keys {
+                    if sys::suspend(k.pid, false).is_ok() {
+                        n += 1;
+                        let _ = sys::prefetch(k.pid);
+                    }
+                }
+                self.toast(format!("Projet « {} » réveillé : {n} processus", pr.name), false);
+                self.sample_now();
+            }
             Action::StartupToggle(i, on) => {
                 if let Some(e) = self.startup.as_ref().and_then(|v| v.get(i)).cloned() {
                     match crate::startup::set_enabled(&e, on) {
@@ -996,6 +1075,13 @@ impl App {
             })
             .map(|p| p.key)
             .collect()
+    }
+
+    /// V3 : dernier jeu vu (nom, pic, RAM disponible maintenant).
+    pub fn last_game(&self) -> Option<(String, u64, u64)> {
+        let g = self.s.game_peaks.values().max_by_key(|g| g.seen)?;
+        let avail = self.snap.as_ref().map(|s| s.totals.mem_total - s.totals.mem_used)?;
+        Some((g.name.clone(), g.peak, avail))
     }
 
     // ---------- Mode avant de jouer ----------

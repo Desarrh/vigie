@@ -5,7 +5,7 @@
 Vigie est le gestionnaire de tâches Windows de l'utilisateur. Il remplace le Gestionnaire des tâches de Windows (option Ctrl+Maj+Échap) et intègre un **chasseur de RAM fantôme** : il repère ce qui tourne pour rien (serveurs de dev oubliés, orphelins, apps cachées, Docker/WSL) et propose de le nettoyer, surtout avant de jouer.
 
 Principes :
-- **Légèreté mesurée** : 48 Mo de mémoire privée au repos (47,4 Mo avant le socle, fenêtre hors écran, `scratchpad/mesure.ps1`), ~3,3 % d'un cœur avec une mesure par seconde (identique avant/après), ~7 ms de mesure par seconde sur un seul thread, ~3–5 ms par image, exe de ~5,8 Mo.
+- **Légèreté mesurée** : 48,6 Mo de mémoire privée au repos avec V1–V4 (47,4 Mo avant le socle, 48,0 après, fenêtre hors écran, `scratchpad/mesure.ps1`), ~3,3 % d'un cœur avec une mesure par seconde (identique avant/après), ~7 ms de mesure par seconde sur un seul thread, ~3–5 ms par image, exe de ~5,8 Mo.
 - **Zéro coût fermé** : pas de service, de tray ni de démarrage auto.
 - **Rien n'est redessiné sans raison** : l'interface attend une mesure ou une action.
 - **Prudence** : rien n'est tué sans confirmation ou case cochée. Liste de processus protégés. Services et session 0 jamais proposés.
@@ -52,6 +52,7 @@ Principes :
 | `docker.rs` | Thread qui interroge `docker ps` / `docker stats` toutes les 20 s, seulement si `com.docker.backend.exe` tourne |
 | `startup.rs` | Apps au démarrage : clés Run HKCU/HKLM/WOW64, dossiers Démarrage, activation via `StartupApproved` |
 | `cli.rs` | Interface sans fenêtre pour les autres applis : `--etat-dev`, `--couper-dev`, réveil des apps endormies (JSON) |
+| `qol.rs` | Pistes validées : V2 projets (`project_of`, `projects`), V3 pics des jeux (`is_game_path`, `track_games`, `missing`), V4 boîte noire (`Moment`, top 5 par ressource), tout calculé sur l'instantané |
 | `journal.rs` | Journal des nettoyages en JSONL (append, lecture des N derniers jours, compactage à 90 jours) |
 | `winfo.rs` | Description lisible d'un exe (ressource `FileDescription`) |
 
@@ -182,10 +183,11 @@ Elle vient du **socle** (`socle::theme`, `socle::icons`, `socle::ui`) depuis la 
 - `--set-taskmgr on|off` : instance élevée éphémère qui écrit la clé IFEO.
 - `--avant-jeu` / `--apres-jeu` (`--json` en option) : sans fenêtre. `--apres-jeu` n'ouvre ni egui ni thread de mesure (~20 ms).
 - `--etat-dev` (1 ligne JSON `{"v":1,"items":[{kind,label,pids,ram_mo,…}],"total_mo"}`, format défini avec Ultimate, ~20–30 ms) et `--couper-dev [--serveurs] [--docker] [--wsl] [--json]` (résumé d'une ligne, sans UAC) : garde-fou dev T2 (`src/cli.rs`, exemples dans le README). Ne touche jamais un arbre avec fenêtre visible, l'appelant et ses ancêtres, Ultimate.exe.
-- Ressource de version `VigieCli` = « avant-jeu apres-jeu etat-dev couper-dev » (`build.rs`) : Ultimate y vérifie les commandes comprises avant de les appeler. **Toute nouvelle commande sans fenêtre doit y être ajoutée.**
+- Ressource de version `VigieCli` = « avant-jeu apres-jeu etat-dev couper-dev memoire-jeu » (`build.rs`) : Ultimate y vérifie les commandes comprises avant de les appeler. **Toute nouvelle commande sans fenêtre doit y être ajoutée.**
+- `--memoire-jeu <exe>` : `{"v":1,"connu":true,"nom","pic_mo","disponible_mo","manque_mo"}` (V3).
 - `%APPDATA%\Vigie\veille.json` : apps endormies par `--avant-jeu`, consommé par `--apres-jeu`.
 
-**Debug / tests** (règle n°0 : ne jamais déranger l'utilisateur) : `VIGIE_CAPTURE=x.png` rend l'interface hors écran sans créer de fenêtre (egui + rendu logiciel dans un tampon, priorité basse), options `VIGIE_VIEW`, `VIGIE_SELECT`, `VIGIE_PALETTE`, `VIGIE_GAME`, `VIGIE_SIZE`, `VIGIE_DUMP`. `VIGIE_DATA_DIR` redirige réglages, journal et veille.json vers un dossier de test.
+**Debug / tests** (règle n°0 : ne jamais déranger l'utilisateur) : `VIGIE_CAPTURE=x.png` rend l'interface hors écran sans créer de fenêtre (egui + rendu logiciel dans un tampon, priorité basse), options `VIGIE_VIEW`, `VIGIE_SELECT`, `VIGIE_PALETTE`, `VIGIE_GAME`, `VIGIE_BB`, `VIGIE_SIZE`, `VIGIE_DUMP`. `VIGIE_DATA_DIR` redirige réglages, journal et veille.json vers un dossier de test.
 
 ## 6. Fonctionnalités
 
@@ -205,6 +207,13 @@ Elle vient du **socle** (`socle::theme`, `socle::icons`, `socle::ui`) depuis la 
 - Vue Démarrage, avec la RAM actuelle de chaque app. L'interrupteur est testé sur une entrée factice.
 - Mise en veille sans fermer : testée, 184 Mo libérés sur un processus de test. Aussi dans le mode jeu.
 - Journal des nettoyages.
+
+**Étape socle + QoL (vérifiée, tests automatiques et captures hors écran)**
+- Migration sur le socle (thème, icônes vectorielles, palette Ctrl+K, autocomplétion floue, toasts, instance unique, crash, Ctrl+1–4 en AZERTY).
+- V1 tuer par port (`:3000` puis Entrée ou Suppr dans la palette).
+- V2 sieste de projet : test qui endort puis réveille un node jetable ; Vigie et ses parents exclus.
+- V3 pics de RAM par jeu : vérifié avec un faux jeu dans un faux `steamapps\common` ; `--memoire-jeu`.
+- V4 boîte noire : survol + épinglage sur les graphiques Performances.
 
 **Pas testé en vrai**
 - **Docker** : Docker Desktop était arrêté. Seul le parsing est testé.
@@ -247,11 +256,11 @@ Le tableau est classé par utilité pour l'utilisateur.
 
 | # | Piste | Type | Pour | Pourquoi ça reste instantané et léger | Effort |
 |---|---|---|---|---|---|
-| 1 | **Autocomplétion de la recherche** : suggestion grisée en fin de saisie (nom d'exe, description, port), Tab pour accepter, ↑↓ pour l'historique des recherches | existe (navigateurs, btop filtre) | tous | Recherche par préfixe sur ~350 noms déjà en mémoire, < 0,1 ms par frappe. Historique de 20 entrées dans `settings.json` | S |
-| 2 | **Sieste de projet** : les processus sont regroupés par projet de dev, déduit du chemin dans la ligne de commande (`C:\Dev\vigie` → « vigie : 4 processus, 1,3 Go »). « Endormir le projet » suspend et met en veille tout l'arbre ; « Réveiller » le relance instantanément, sans rien relancer | inédite | dev | Lignes de commande déjà en cache. Regroupement par préfixe de chemin, une fois par mesure. Suspendre et mettre en veille sont des appels noyau de quelques µs par processus | M |
-| 3 | **« Il te manque 3 Go pour ce jeu »** : Vigie retient le pic de RAM de chaque jeu (exe vu par le launcher ou en plein écran). Avant le lancement suivant, il calcule ce qui manque et propose exactement quoi libérer | inédite | jeu | Un nombre par jeu dans `settings.json`. Comparaison avec la RAM libre déjà mesurée : aucun coût à l'exécution | M |
-| 4 | **Boîte noire « pourquoi ça a ramé ? »** : clic sur un pic du graphique Performances → les 5 processus responsables à cet instant précis, même s'ils sont morts depuis | inédite (Resource Monitor ne garde rien) | jeu, YouTube | Anneau de 120 × top-5 (PID, nom, CPU, disque) rempli pendant la mesure : ~10 Ko, aucun calcul à l'affichage | S |
-| 5 | **Tuer par port** : taper `:3000` puis Suppr dans la palette ou la recherche termine ce qui écoute dessus (fini les EADDRINUSE) | inédite sous cette forme | dev | Table des ports déjà dans l'instantané ; une seule action | S |
+| 1 | ✅ fait (T4, socle) — **Autocomplétion de la recherche** : suggestion grisée en fin de saisie (nom d'exe, description, port), Tab pour accepter, ↑↓ pour l'historique des recherches | existe (navigateurs, btop filtre) | tous | Recherche par préfixe sur ~350 noms déjà en mémoire, < 0,1 ms par frappe. Historique de 20 entrées dans `settings.json` | S |
+| 2 | ✅ fait (V2) — **Sieste de projet** : les processus sont regroupés par projet de dev, déduit du chemin dans la ligne de commande (`C:\Dev\vigie` → « vigie : 4 processus, 1,3 Go »). « Endormir le projet » suspend et met en veille tout l'arbre ; « Réveiller » le relance instantanément, sans rien relancer | inédite | dev | Lignes de commande déjà en cache. Regroupement par préfixe de chemin, une fois par mesure. Suspendre et mettre en veille sont des appels noyau de quelques µs par processus | M |
+| 3 | ✅ fait (V3) — **« Il te manque 3 Go pour ce jeu »** : Vigie retient le pic de RAM de chaque jeu (exe vu par le launcher ou en plein écran). Avant le lancement suivant, il calcule ce qui manque et propose exactement quoi libérer | inédite | jeu | Un nombre par jeu dans `settings.json`. Comparaison avec la RAM libre déjà mesurée : aucun coût à l'exécution | M |
+| 4 | ✅ fait (V4) — **Boîte noire « pourquoi ça a ramé ? »** : clic sur un pic du graphique Performances → les 5 processus responsables à cet instant précis, même s'ils sont morts depuis | inédite (Resource Monitor ne garde rien) | jeu, YouTube | Anneau de 120 × top-5 (PID, nom, CPU, disque) rempli pendant la mesure : ~10 Ko, aucun calcul à l'affichage | S |
+| 5 | ✅ fait (V1) — **Tuer par port** : taper `:3000` puis Suppr dans la palette ou la recherche termine ce qui écoute dessus (fini les EADDRINUSE) | inédite sous cette forme | dev | Table des ports déjà dans l'instantané ; une seule action | S |
 | 6 | **Naissances / morts surlignées** : vert 2 s pour un nouveau processus, rouge 2 s pour un processus qui disparaît (la ligne reste affichée, barrée) | existe (Process Explorer, System Informer) | tous | Différence de deux ensembles de clés déjà calculée à chaque mesure ; fondu géré par egui, sans mesure supplémentaire | S |
 | 7 | **Viseur « quelle appli est-ce ? »** : glisser une cible sur n'importe quelle fenêtre → sélection de son processus (utile pour une pop-up inconnue ou un overlay) | existe (Process Explorer) | tous | `WindowFromPoint` + `GetWindowThreadProcessId` au relâchement de la souris : 1 appel | S |
 | 8 | **Fantômes qui reviennent** : Vigie repère une app tuée qui réapparaît dans l'heure, et propose de couper sa vraie source (entrée de démarrage, tâche planifiée, service qui la relance) | inédite | jeu, dev | Ensemble des noms tués récemment (déjà dans le journal) comparé aux naissances de l'instantané. Lecture des tâches planifiées seulement quand une résurrection est détectée | M |

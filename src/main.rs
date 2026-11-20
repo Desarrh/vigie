@@ -7,6 +7,7 @@ mod docker;
 mod hunter;
 mod journal;
 mod pdh;
+mod qol;
 mod sampler;
 mod startup;
 mod sys;
@@ -328,6 +329,20 @@ fn main() {
     // Pour Ultimate (garde-fou dev avant de jouer) : toujours en JSON
     if args.iter().any(|a| a == "--etat-dev") {
         println!("{}", serde_json::to_string(&cli::etat()).unwrap_or_default());
+        std::process::exit(0);
+    }
+    // V3, pour Ultimate : pic de RAM connu d'un jeu et ce qu'il manque maintenant (JSON, ~1 ms)
+    if let Some(i) = args.iter().position(|a| a == "--memoire-jeu") {
+        let jeu = args.get(i + 1).cloned().unwrap_or_default();
+        let s = app::Settings::load();
+        let m = sys::memory();
+        let avail = m.avail;
+        let g = s.game_peaks.get(&qol::game_key(&jeu)).or_else(|| s.game_peaks.get(&format!("{}.exe", qol::game_key(&jeu))));
+        let v = match g {
+            Some(g) => serde_json::json!({"v": 1, "connu": true, "nom": g.name, "pic_mo": g.peak >> 20, "disponible_mo": avail >> 20, "manque_mo": qol::missing(g.peak, avail) >> 20}),
+            None => serde_json::json!({"v": 1, "connu": false, "disponible_mo": avail >> 20}),
+        };
+        println!("{v}");
         std::process::exit(0);
     }
     if args.iter().any(|a| a == "--couper-dev") {

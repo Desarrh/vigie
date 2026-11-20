@@ -345,6 +345,28 @@ impl App {
                 if r.clicked() {
                     self.s.view = View::Hunter;
                 }
+                // V2 : sieste de projet
+                if !self.projects.is_empty() {
+                    ui.add_space(8.0);
+                    section(ui, &p, "Projets");
+                    for pr in self.projects.clone().iter().take(6) {
+                        let (rect, r) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::hover());
+                        if r.hovered() {
+                            ui.painter().rect_filled(rect, CornerRadius::same(7), p.hover_bg);
+                        }
+                        let asleep = pr.asleep();
+                        let c = if asleep { p.muted } else { p.text };
+                        ui.painter().text(pos2(rect.left() + 10.0, rect.top() + 12.0), Align2::LEFT_CENTER, &pr.name, FontId::proportional(13.0), c);
+                        let sub = if asleep { format!("endormi · {} processus", pr.keys.len()) } else { format!("{} processus · {}", pr.keys.len(), human_bytes(pr.ram)) };
+                        ui.painter().text(pos2(rect.left() + 10.0, rect.top() + 29.0), Align2::LEFT_CENTER, sub, FontId::proportional(11.0), p.muted);
+                        let br = Rect::from_center_size(pos2(rect.right() - 18.0, rect.center().y), vec2(28.0, 28.0));
+                        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(br));
+                        let (icon, tip) = if asleep { (Icon::Bolt, "Réveiller le projet") } else { (Icon::Sleep, "Endormir le projet : suspend ses processus et libère leur RAM, sans rien fermer") };
+                        if icons::button(&mut child, icon, 28.0, Look::tool(&p), tip).clicked() {
+                            self.actions.push(if asleep { Action::WakeProject(pr.dir.clone()) } else { Action::SleepProject(pr.dir.clone()) });
+                        }
+                    }
+                }
                 ui.add_space(8.0);
                 section(ui, &p, "Session");
                 let txt = format!(
@@ -1049,6 +1071,7 @@ impl App {
                     }
                 }
                 ui.add_space(18.0);
+                self.draw_games(ui);
                 self.draw_journal(ui);
                 ui.add_space(10.0);
                 egui::CollapsingHeader::new(RichText::new(format!("Liste blanche ({})", self.s.whitelist.len())).color(p.muted)).id_salt("wl").show(ui, |ui| {
@@ -1090,6 +1113,15 @@ impl App {
                 let cw = (w - 16.0 * (cols as f32 - 1.0)) / cols as f32;
                 let disk_max = self.hist.disk.max().max(1024.0 * 1024.0) * 1.15;
                 let net_max = self.hist.net.max().max(256.0 * 1024.0) * 1.15;
+                use crate::qol::Metric;
+                let metric_of = |t: &str| match t {
+                    "Processeur" => Some(Metric::Cpu),
+                    "Mémoire" => Some(Metric::Mem),
+                    "GPU" => Some(Metric::Gpu),
+                    "Disque" => Some(Metric::Disk),
+                    _ => None,
+                };
+                let mut pin: Option<(Metric, usize)> = None;
                 let cards: Vec<(&str, String, String, &Hist, f32, Color32)> = vec![
                     ("Processeur", pct(t.cpu), format!("{} cœurs logiques · {} threads", snap.ncpu, fmt_int(t.threads as u64)), &self.hist.cpu, 100.0, p.accent),
                     (
@@ -1130,19 +1162,88 @@ impl App {
                                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(RichText::new(big).size(15.0).color(color).strong()));
                                     });
                                     ui.label(RichText::new(small).size(11.5).color(p.muted));
-                                    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 120.0), Sense::hover());
+                                    let metric = metric_of(title);
+                                    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 120.0), if metric.is_some() { Sense::click() } else { Sense::hover() });
                                     ui.painter().rect_filled(r, CornerRadius::same(6), p.code);
                                     for i in 1..4 {
                                         let y = r.top() + r.height() * i as f32 / 4.0;
                                         ui.painter().line_segment([pos2(r.left(), y), pos2(r.right(), y)], Stroke::new(1.0, p.border.gamma_multiply(0.5)));
                                     }
                                     graph(ui, r.shrink(2.0), h, max, color, true);
+                                    // V4 : survol = les 5 coupables de cet instant ; clic = épingler
+                                    if let Some(m) = metric {
+                                        let pinned = self.bb_pin.filter(|(pm, _)| *pm == m).map(|(_, i)| i);
+                                        let hover_i = resp.hover_pos().and_then(|pos| bb_index(r.shrink(2.0), pos.x, self.blackbox.len()));
+                                        for i in [pinned, hover_i].into_iter().flatten() {
+                                            let x = bb_x(r.shrink(2.0), i, self.blackbox.len());
+                                            ui.painter().line_segment([pos2(x, r.top()), pos2(x, r.bottom())], Stroke::new(1.0, p.text.gamma_multiply(0.5)));
+                                        }
+                                        if let Some(i) = hover_i {
+                                            if let Some(mo) = self.blackbox.get(i) {
+                                                let list = mo.list(m).to_vec();
+                                                let ago = mo.at.elapsed().as_secs();
+                                                resp.clone().on_hover_ui_at_pointer(|ui| {
+                                                    ui.label(RichText::new(format!("il y a {ago} s — clic pour épingler")).size(11.5).color(p.muted));
+                                                    for c in &list {
+                                                        ui.label(format!("{}  {}", c.name, fmt_metric(m, c.value)));
+                                                    }
+                                                    if list.is_empty() {
+                                                        ui.label(RichText::new("rien de notable").color(p.muted));
+                                                    }
+                                                });
+                                            }
+                                            if resp.clicked() {
+                                                pin = Some((m, i));
+                                            }
+                                        }
+                                    }
                                     ui.label(RichText::new(format!("{} s d’historique", crate::app::HIST as u64 * self.s.interval_ms / 1000)).size(10.5).color(p.muted));
                                 });
                             });
                         }
                     });
                     ui.add_space(12.0);
+                }
+                if let Some(pn) = pin {
+                    self.bb_pin = if self.bb_pin == Some(pn) { None } else { Some(pn) };
+                }
+                // V4 : boîte noire épinglée
+                if let Some((m, i)) = self.bb_pin {
+                    if let Some(mo) = self.blackbox.get(i).cloned() {
+                        Frame::new().fill(p.live_bg).corner_radius(CornerRadius::same(10)).inner_margin(Margin::same(12)).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                let (ir, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+                                icons::paint(ui.painter(), ir, Icon::Clock, p.live);
+                                let what = match m {
+                                    Metric::Cpu => "processeur",
+                                    Metric::Mem => "mémoire",
+                                    Metric::Gpu => "GPU",
+                                    Metric::Disk => "disque",
+                                };
+                                ui.label(RichText::new(format!("Boîte noire · {what} · il y a {} s", mo.at.elapsed().as_secs())).strong().color(p.live));
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if icons::button(ui, Icon::Close, 24.0, Look::tool(&p), "Fermer").clicked() {
+                                        self.bb_pin = None;
+                                    }
+                                });
+                            });
+                            for c in mo.list(m) {
+                                ui.horizontal(|ui| {
+                                    let alive = self.proc(c.key).is_some();
+                                    if alive {
+                                        if ui.link(&c.name).clicked() {
+                                            acts.push(Action::Select(c.key));
+                                        }
+                                    } else {
+                                        ui.label(RichText::new(format!("{} (terminé depuis)", c.name)).color(p.muted));
+                                    }
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(RichText::new(fmt_metric(m, c.value)).color(p.muted)));
+                                });
+                            }
+                        });
+                        ui.add_space(12.0);
+                    }
                 }
                 // plus gros consommateurs
                 ui.columns(2, |c| {
@@ -1226,6 +1327,17 @@ impl App {
         let mut open = true;
         egui::Window::new("Mode avant de jouer").open(&mut open).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(&ctx, |ui| {
             ui.set_width(440.0);
+            // V3 : « il te manque X Go » pour le dernier jeu joué
+            if let Some((name, peak, avail)) = self.last_game() {
+                let miss = crate::qol::missing(peak, avail);
+                let (txt, c) = if miss == 0 {
+                    (format!("{name} : pic {} · {} disponibles — ça passe", human_bytes(peak), human_bytes(avail)), p.add)
+                } else {
+                    (format!("{name} : pic {} · il te manque {} — coche ce qu’il faut ci-dessous", human_bytes(peak), human_bytes(miss)), p.live)
+                };
+                icon_label(ui, Icon::Gamepad, txt, 12.5, c);
+                ui.add_space(6.0);
+            }
             ui.checkbox(&mut self.s.game_kill, format!("Chasser les fantômes sûrs — {} processus, {}", safe.len(), human_bytes(safe_ram)));
             if !safe.is_empty() {
                 let names: Vec<String> = safe.iter().take(5).map(|g| g.name.clone()).collect();
@@ -1354,8 +1466,37 @@ impl App {
         if !self.elevated {
             v.push(Command::new("elevate", "Relancer en administrateur").group("Système").icon(Icon::Shield));
         }
+        // V2 : projets en cours
+        for pr in &self.projects {
+            if pr.asleep() {
+                v.push(Command::new(format!("wake:{}", pr.dir), format!("Réveiller le projet {}", pr.name)).group("Projets").icon(Icon::Bolt));
+            } else {
+                v.push(
+                    Command::new(format!("sleep:{}", pr.dir), format!("Endormir le projet {} · {} processus, {}", pr.name, pr.keys.len(), human_bytes(pr.ram)))
+                        .group("Projets")
+                        .icon(Icon::Sleep),
+                );
+            }
+        }
         // processus correspondant à la saisie : « Aller à » et « Terminer tous les … »
         let q = self.palette.query().trim().to_lowercase();
+        // V1 : « :3000 » → terminer ce qui écoute sur ce port (Entrée, ou Suppr directement)
+        if let (Some(port), Some(snap)) = (port_query(&q), &self.snap) {
+            let owners: Vec<&Proc> = snap.procs.iter().filter(|x| x.ports.iter().any(|pp| pp.tcp && pp.port == port)).collect();
+            if owners.is_empty() {
+                v.insert(0, Command::new(format!("port:{port}"), format!("Rien n’écoute sur :{port}")).group("Port").icon(Icon::Info).enabled(false));
+            } else {
+                let who: Vec<String> = owners.iter().take(2).map(|x| format!("{} ({})", x.name, x.key.pid)).collect();
+                let ram: u64 = owners.iter().map(|x| x.mem).sum();
+                v.insert(
+                    0,
+                    Command::new(format!("port:{port}"), format!(":{port} — terminer {} · {}", who.join(", "), human_bytes(ram)))
+                        .group("Port")
+                        .keys("Suppr")
+                        .icon(Icon::Close),
+                );
+            }
+        }
         if let Some(snap) = &self.snap {
             if q.len() >= 2 && !q.starts_with(':') {
                 let mut ps: Vec<&Proc> = snap.procs.iter().filter(|x| socle::fuzzy::score(&x.name, &q).is_some() || x.key.pid.to_string() == q).collect();
@@ -1407,7 +1548,13 @@ impl App {
             }
             "elevate" => Action::Elevate,
             _ => {
-                if let Some(rest) = id.strip_prefix("goto:") {
+                if let Some(port) = id.strip_prefix("port:").and_then(|x| x.parse().ok()) {
+                    self.actions.push(Action::KillPort(port));
+                } else if let Some(dir) = id.strip_prefix("sleep:") {
+                    self.actions.push(Action::SleepProject(dir.to_string()));
+                } else if let Some(dir) = id.strip_prefix("wake:") {
+                    self.actions.push(Action::WakeProject(dir.to_string()));
+                } else if let Some(rest) = id.strip_prefix("goto:") {
                     let mut it = rest.split(':');
                     if let (Some(pid), Some(ct)) = (it.next().and_then(|x| x.parse().ok()), it.next().and_then(|x| x.parse().ok())) {
                         self.actions.push(Action::Select(Key { pid, ctime: ct }));
@@ -1427,8 +1574,16 @@ impl App {
         if !self.palette.is_open() {
             return;
         }
-        let cmds = self.palette_commands();
         let ctx = ui.ctx().clone();
+        // V1 : « :3000 » puis Suppr = terminer tout de suite (avec confirmation selon le réglage)
+        if let Some(port) = port_query(self.palette.query()) {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete)) {
+                self.palette.close();
+                self.actions.push(Action::KillPort(port));
+                return;
+            }
+        }
+        let cmds = self.palette_commands();
         let p = self.pal;
         if let Some(id) = self.palette.show(&ctx, &p, &cmds) {
             self.run_command(&id);
@@ -1577,6 +1732,38 @@ impl App {
 }
 
 impl App {
+    // ---------- V3 : jeux suivis ----------
+    fn draw_games(&mut self, ui: &mut Ui) {
+        let p = self.pal;
+        if self.s.game_peaks.is_empty() {
+            return;
+        }
+        let avail = self.snap.as_ref().map(|s| s.totals.mem_total - s.totals.mem_used).unwrap_or(0);
+        let recup: u64 = self.ghosts.iter().map(|g| g.ram).sum();
+        section(ui, &p, "Jeux");
+        let mut games: Vec<crate::qol::GamePeak> = self.s.game_peaks.values().cloned().collect();
+        games.sort_by(|a, b| b.seen.cmp(&a.seen));
+        for g in games.iter().take(8) {
+            let miss = crate::qol::missing(g.peak, avail);
+            ui.horizontal(|ui| {
+                let (ir, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
+                icons::paint(ui.painter(), ir, Icon::Gamepad, p.muted);
+                ui.label(RichText::new(&g.name).size(13.0));
+                ui.label(RichText::new(format!("pic {}", human_bytes(g.peak))).size(12.0).color(p.muted));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if miss == 0 {
+                        ui.label(RichText::new("ça passe").size(12.0).color(p.add));
+                    } else if miss <= recup {
+                        ui.label(RichText::new(format!("il te manque {} — le chasseur en récupère {}", human_bytes(miss), human_bytes(recup))).size(12.0).color(p.live));
+                    } else {
+                        ui.label(RichText::new(format!("il te manque {}", human_bytes(miss))).size(12.0).color(p.del));
+                    }
+                });
+            });
+        }
+        ui.add_space(10.0);
+    }
+
     // ---------- Journal ----------
     fn draw_journal(&mut self, ui: &mut Ui) {
         let p = self.pal;
@@ -1716,6 +1903,37 @@ impl App {
     }
 }
 
+/// « :3000 » ou « 3000 » (que des chiffres) → port.
+fn port_query(q: &str) -> Option<u16> {
+    let t = q.trim();
+    let d = t.strip_prefix(':')?;
+    (!d.is_empty() && d.chars().all(|c| c.is_ascii_digit())).then(|| d.parse().ok()).flatten()
+}
+
+/// Index de l'anneau de la boîte noire sous l'abscisse `x` (graphiques alignés à droite, comme `graph`).
+fn bb_index(rect: Rect, x: f32, len: usize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let step = rect.width() / (crate::app::HIST - 1) as f32;
+    let from_right = ((rect.right() - x) / step).round().max(0.0) as usize;
+    (from_right < len).then(|| len - 1 - from_right)
+}
+
+fn bb_x(rect: Rect, i: usize, len: usize) -> f32 {
+    let step = rect.width() / (crate::app::HIST - 1) as f32;
+    rect.right() - (len - 1 - i) as f32 * step
+}
+
+fn fmt_metric(m: crate::qol::Metric, v: f64) -> String {
+    use crate::qol::Metric;
+    match m {
+        Metric::Cpu | Metric::Gpu => pct(v as f32),
+        Metric::Mem => human_bytes(v as u64),
+        Metric::Disk => human_rate(v),
+    }
+}
+
 fn fmt_int(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::new();
@@ -1754,6 +1972,15 @@ mod tests {
         press(&ctx, &mut app, Key::P, Modifiers { ctrl: true, command: true, ..Default::default() });
         assert!(app.palette.is_open());
         assert_eq!(app.s.view, View::Hunter);
+    }
+
+    #[test]
+    fn port_query() {
+        assert_eq!(super::port_query(":3000"), Some(3000));
+        assert_eq!(super::port_query(" :5173 "), Some(5173));
+        assert_eq!(super::port_query("3000"), None);
+        assert_eq!(super::port_query(":abc"), None);
+        assert_eq!(super::port_query(":"), None);
     }
 
     /// AZERTY : la touche 4 envoie « ' » (Key::Quote) avec la touche physique Num4.
