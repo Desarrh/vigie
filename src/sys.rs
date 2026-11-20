@@ -108,6 +108,8 @@ pub struct Raw {
     pub private_ws: u64,
     /// mémoire engagée (privée)
     pub commit: u64,
+    /// pic de mémoire engagée privée tenu par le noyau depuis le lancement du processus
+    pub peak_commit: u64,
     pub ws: u64,
     pub io_read: u64,
     pub io_write: u64,
@@ -167,6 +169,7 @@ pub fn query_processes(buf: &mut Vec<u8>) -> Vec<Raw> {
             cpu_time: p.UserTime + p.KernelTime,
             private_ws: p.WorkingSetPrivateSize.max(0) as u64,
             commit: p.PrivatePageCount as u64,
+            peak_commit: p.PeakPagefileUsage as u64,
             ws: p.WorkingSetSize as u64,
             io_read: p.ReadTransferCount.max(0) as u64,
             io_write: p.WriteTransferCount.max(0) as u64,
@@ -729,12 +732,28 @@ pub fn power_label(guid: &str) -> Option<String> {
     (r == 0).then(|| from_wide(&buf)).filter(|s| !s.is_empty())
 }
 
+/// État minimal du processeur (%) sur secteur pour un plan (`PROCTHROTTLEMIN`).
+pub fn proc_min_ac(guid: &str) -> Option<u32> {
+    use windows_sys::Win32::System::Power::PowerReadACValueIndex;
+    // GUID_PROCESSOR_SETTINGS_SUBGROUP, GUID_PROCESSOR_THROTTLE_MINIMUM
+    let sub = windows_sys::core::GUID::from_u128(0x54533251_82be_4824_96c1_47b60b740d00);
+    let set = windows_sys::core::GUID::from_u128(0x893dee8e_2bef_41e0_89c6_b55d0929964c);
+    let g = parse_guid(guid)?;
+    let mut v = 0u32;
+    (unsafe { PowerReadACValueIndex(std::ptr::null_mut(), &g, &sub, &set, &mut v) } == 0).then_some(v)
+}
+
 /// Plan actif : (GUID, nom, déjà « performances maximales » ?). Un seul passage, sans powercfg.
 pub fn active_power_info() -> Option<(String, String, bool)> {
     let g = active_power_scheme()?;
     let label = power_label(&g).unwrap_or_else(|| g.clone());
     let l = label.to_lowercase();
-    let max = g == HIGH_PERF || g == "e9a42b02-d5df-448d-aa00-03f14749eb61" || ["ultimate", "optimal", "high perf", "élevées", "elevees", "maximal"].iter().any(|k| l.contains(k));
+    // « déjà au maximum » : GUID connus, sinon le réglage qui compte vraiment (état minimal du
+    // processeur à 100 % sur secteur), et seulement en dernier recours le nom localisé
+    let max = g == HIGH_PERF
+        || g == "e9a42b02-d5df-448d-aa00-03f14749eb61"
+        || proc_min_ac(&g) == Some(100)
+        || ["ultimate", "optimal", "high perf", "élevées", "elevees", "maximal"].iter().any(|k| l.contains(k));
     Some((g, label, max))
 }
 
@@ -770,6 +789,20 @@ pub fn taskmgr_debugger() -> Option<String> {
 /// porte (n'importe quel programme pourrait le remplacer et être lancé à la place du Gestionnaire).
 pub fn taskmgr_target() -> Option<std::path::PathBuf> {
     std::env::var_os("ProgramFiles").map(|p| std::path::PathBuf::from(p).join("Vigie").join("Vigie.exe"))
+}
+
+/// La copie de Program Files inscrite dans IFEO diffère-t-elle de l'exe en cours ? (lecture des
+/// deux fichiers, ~6 Mo chacun : à appeler sur un thread). Faux si l'option n'est pas active
+/// ou si c'est la copie elle-même qui tourne.
+pub fn taskmgr_copy_stale() -> bool {
+    let (Some(t), Ok(me)) = (taskmgr_target(), std::env::current_exe()) else { return false };
+    if !taskmgr_replaced() || me.eq(&t) || !t.is_file() {
+        return false;
+    }
+    match (std::fs::read(&t), std::fs::read(&me)) {
+        (Ok(a), Ok(b)) => a != b,
+        _ => false,
+    }
 }
 
 pub fn taskmgr_replaced() -> bool {

@@ -46,6 +46,37 @@ pub fn load(days: u64) -> Vec<Rec> {
     all.into_iter().filter(|r| n.saturating_sub(r.t) < days * 86_400).collect()
 }
 
+/// Relevé d'inactivité : temps CPU de chaque processus au moment de l'enregistrement
+/// (fermeture de Vigie, et toutes les 5 min en cas de plantage). Au lancement suivant, un
+/// processus au même temps CPU est inactif depuis au moins ce moment-là. Rien ne tourne
+/// pendant que Vigie est fermée.
+#[derive(Serialize, Deserialize, Default)]
+pub struct Releve {
+    /// secondes Unix de l'enregistrement
+    pub t: u64,
+    /// (pid, date de création, temps CPU)
+    pub p: Vec<(u32, i64, i64)>,
+}
+
+impl Releve {
+    fn path() -> Option<std::path::PathBuf> {
+        crate::app::Settings::dir().map(|d| d.join("releve.json"))
+    }
+    pub fn save(procs: &[crate::sampler::Proc]) {
+        let Some(p) = Self::path() else { return };
+        let r = Releve { t: now(), p: procs.iter().filter(|x| x.key.pid > 4).map(|x| (x.key.pid, x.key.ctime, x.cpu_time)).collect() };
+        let _ = std::fs::create_dir_all(p.parent().unwrap());
+        if let Ok(b) = serde_json::to_vec(&r) {
+            let _ = std::fs::write(p, b);
+        }
+    }
+    /// (instant de l'enregistrement, (pid, ctime) → temps CPU)
+    pub fn load() -> Option<(u64, std::collections::HashMap<(u32, i64), i64>)> {
+        let r: Releve = serde_json::from_slice(&std::fs::read(Self::path()?).ok()?).ok()?;
+        Some((r.t, r.p.into_iter().map(|(pid, ct, cpu)| ((pid, ct), cpu)).collect()))
+    }
+}
+
 pub fn ago(t: u64) -> String {
     let d = now().saturating_sub(t);
     if d < 60 {

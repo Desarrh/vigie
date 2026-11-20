@@ -23,6 +23,9 @@ pub struct Item {
     pub label: String,
     pub pids: Vec<u32>,
     pub ram_mo: u64,
+    /// identifiant à renvoyer à `--couper-dev --seulement` : `pid:ctime` de la racine d'un serveur
+    /// (vérifie aussi qu'il s'agit du même processus), `docker` ou `wsl`
+    pub cle: String,
     /// champs en plus (tolérés par Ultimate)
     pub ports: Vec<u16>,
     pub projet: Option<String>,
@@ -226,13 +229,14 @@ pub fn etat() -> Etat {
             label: label(&name, cmd.as_deref()),
             pids: ks.iter().map(|k| k.pid).collect(),
             ram_mo: mo(v.ram(&ks)),
+            cle: format!("{}:{}", root.pid, root.ctime),
             ports,
             projet: cmd.as_deref().and_then(projet),
         });
     }
     let dk = docker_keys(&v);
     if !dk.is_empty() {
-        items.push(Item { kind: "docker", label: "Docker Desktop".into(), pids: dk.iter().map(|k| k.pid).collect(), ram_mo: mo(v.ram(&dk)), ports: vec![], projet: None });
+        items.push(Item { kind: "docker", label: "Docker Desktop".into(), pids: dk.iter().map(|k| k.pid).collect(), ram_mo: mo(v.ram(&dk)), cle: "docker".into(), ports: vec![], projet: None });
     }
     let w = wsl_raws(&v);
     if !w.is_empty() {
@@ -241,6 +245,7 @@ pub fn etat() -> Etat {
             label: "WSL (vmmemWSL)".into(),
             pids: w.iter().map(|r| r.pid).collect(),
             ram_mo: mo(w.iter().map(|r| r.ws.max(r.private_ws)).sum()),
+            cle: "wsl".into(),
             ports: vec![],
             projet: None,
         });
@@ -310,18 +315,22 @@ fn tuer_arbre(v: &Vue, ks: &[Key], c: &mut Coupe) -> (usize, u64) {
     (n, b)
 }
 
-pub fn couper(serv: bool, dock: bool, wsl: bool) -> Coupe {
-    couper_vue(&Vue::lire(), serv, dock, wsl, None)
+/// `seulement` : ne couper que ces éléments (clés `cle` renvoyées par `--etat-dev` : `pid:ctime`,
+/// `docker`, `wsl`). Ainsi l'utilisateur confirme exactement ce qui sera arrêté : un serveur
+/// apparu entre-temps, ou un PID réutilisé par un autre processus, n'est pas touché.
+pub fn couper(serv: bool, dock: bool, wsl: bool, seulement: Option<&HashSet<String>>) -> Coupe {
+    couper_vue(&Vue::lire(), serv, dock, wsl, seulement)
 }
 
-/// `seulement` : ne couper que ces racines de serveurs (tests).
-fn couper_vue(v: &Vue, serv: bool, dock: bool, wsl: bool, seulement: Option<&HashSet<u32>>) -> Coupe {
+fn couper_vue(v: &Vue, serv: bool, dock: bool, wsl: bool, seulement: Option<&HashSet<String>>) -> Coupe {
+    let permis = |cle: &str| seulement.map(|s| s.contains(cle)).unwrap_or(true);
+    let (dock, wsl) = (dock && permis("docker"), wsl && permis("wsl"));
     let mut c = Coupe::default();
     let mut recs = Vec::new();
     let now = crate::journal::now();
     if serv {
         for (root, ks) in serveurs(v, sys::current_session()) {
-            if seulement.map(|s| !s.contains(&root.pid)).unwrap_or(false) {
+            if !permis(&format!("{}:{}", root.pid, root.ctime)) {
                 continue;
             }
             let name = v.raw(root).map(|r| r.name.clone()).unwrap_or_default();
@@ -445,6 +454,7 @@ mod couper_tests {
             cpu_time: 0,
             private_ws: 50 << 20,
             commit: 0,
+            peak_commit: 0,
             ws: 50 << 20,
             io_read: 0,
             io_write: 0,
@@ -504,8 +514,13 @@ mod couper_tests {
         while !sys::ports().get(&pid).map(|p| p.iter().any(|x| x.port == 48129)).unwrap_or(false) && t0.elapsed().as_secs() < 5 {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        let seul: HashSet<u32> = [pid].into_iter().collect();
-        let c = couper_vue(&Vue::lire(), true, false, false, Some(&seul));
+        let v = Vue::lire();
+        let ct = v.keys[&pid].ctime;
+        // une mauvaise date de création (PID réutilisé) ne doit rien couper
+        let faux: HashSet<String> = [format!("{pid}:{}", ct + 1)].into_iter().collect();
+        assert_eq!(couper_vue(&v, true, false, false, Some(&faux)).serveurs, 0);
+        let seul: HashSet<String> = [format!("{pid}:{ct}")].into_iter().collect();
+        let c = couper_vue(&v, true, false, false, Some(&seul));
         assert_eq!(c.serveurs, 1, "{:?}", c.erreurs);
         assert!(c.libere > 0);
         assert!(child.wait().is_ok());

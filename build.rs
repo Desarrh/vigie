@@ -8,7 +8,7 @@ fn main() {
             .set("FileDescription", "Vigie")
             // Commandes sans fenêtre comprises par cet exe (lu par Ultimate avant d'appeler --etat-dev…).
             // Ajouter ici toute nouvelle commande sans fenêtre.
-            .set("VigieCli", "avant-jeu apres-jeu etat-dev couper-dev memoire-jeu memoire-jeu-dossier")
+            .set("VigieCli", "avant-jeu apres-jeu etat-dev couper-dev memoire-jeu memoire-jeu-dossier couper-dev-seulement")
             .set("ProductName", "Vigie")
             .set("InternalName", "vigie")
             .set("OriginalFilename", "Vigie.exe")

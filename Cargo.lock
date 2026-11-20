@@ -2069,8 +2069,7 @@ dependencies = [
 
 [[package]]
 name = "socle"
-version = "0.1.4"
-source = "git+https://github.com/Desarrh/socle?tag=v0.1.4#4e2bd5d82f47c8a53cbd2f54e826de3ab5823b81"
+version = "0.1.5"
 dependencies = [
  "egui",
  "memchr",
@@ -3075,7 +3074,3 @@ checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
 dependencies = [
  "zune-core",
 ]
-
-[[patch.unused]]
-name = "socle"
-version = "0.1.5"

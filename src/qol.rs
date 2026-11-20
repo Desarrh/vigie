@@ -246,6 +246,9 @@ pub fn track_games(snap: &Snapshot, peaks: &mut HashMap<String, GamePeak>, desc:
             e.path = path.to_string();
             changed = true;
         }
+        // le noyau garde le pic de la racine : un pic bref entre deux mesures (10 s en plein écran)
+        // n'est pas perdu. L'arbre, lui, est mesuré à l'instant (les pics des enfants ne coïncident pas).
+        let ram = ram.max(p.peak_commit);
         if ram > e.peak {
             e.peak = ram;
             changed = true;

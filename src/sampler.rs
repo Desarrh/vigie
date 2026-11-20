@@ -29,8 +29,12 @@ pub struct Proc {
     pub base_prio: i32,
     pub suspended: bool,
     pub cpu: f32,
+    /// temps CPU cumulé (100 ns) : relevé d'inactivité d'une session à l'autre
+    pub cpu_time: i64,
     pub mem: u64,
     pub commit: u64,
+    /// pic de mémoire engagée privée tenu par le noyau (pics des jeux même entre deux mesures)
+    pub peak_commit: u64,
     pub ws: u64,
     pub disk: f64,
     pub gpu: f32,
@@ -112,7 +116,9 @@ pub fn spawn(interval: Duration, gpu: bool, out: impl Fn(Arc<Snapshot>) + Send +
 fn run(rx: Receiver<Cmd>, mut interval: Duration, mut gpu: bool, out: impl Fn(Arc<Snapshot>)) {
     let ncpu = sys::cpu_count();
     let mut buf = Vec::new();
-    let mut pdh = Pdh::new(gpu);
+    // compteurs PDH (GPU, disque, réseau) créés après la première mesure : leur initialisation
+    // prend plusieurs centaines de ms, la fenêtre doit avoir ses données avant (objectif < 300 ms)
+    let mut pdh: Option<Pdh> = None;
     let mut prev: HashMap<Key, Prev> = HashMap::new();
     let mut cache: HashMap<Key, Cached> = HashMap::new();
     let mut last_t = Instant::now();
@@ -123,6 +129,7 @@ fn run(rx: Receiver<Cmd>, mut interval: Duration, mut gpu: bool, out: impl Fn(Ar
     let empty_ports: Arc<[Port]> = Arc::from(Vec::new());
     let mut names: HashMap<String, Arc<str>> = HashMap::new();
     let mut last_pdh = crate::pdh::Sample::default();
+    let releve = crate::journal::Releve::load();
     loop {
         let t0 = Instant::now();
         // jeu / vidéo en plein écran : même régime que la fenêtre réduite
@@ -179,8 +186,15 @@ fn run(rx: Receiver<Cmd>, mut interval: Duration, mut gpu: bool, out: impl Fn(Ar
                 None if tick == 0 => {
                     let age = ((filetime_now() - r.create_time).max(0) as f64 / 1e7).max(1.0);
                     let avg = r.cpu_time as f64 / 1e7 / age;
-                    let since = if avg < 0.003 { Duration::from_secs_f64(age.min(86_400.0)) } else { Duration::ZERO };
-                    (0.0, 0.0, now.checked_sub(since).unwrap_or(now), true)
+                    let mut since = if avg < 0.003 { age.min(86_400.0) } else { 0.0 };
+                    // relevé de la session précédente : même processus, même temps CPU
+                    // = inactif depuis au moins la fermeture de Vigie (minimum exact)
+                    if let Some((at, cpus)) = &releve {
+                        if cpus.get(&(r.pid, r.create_time)) == Some(&r.cpu_time) {
+                            since = since.max(crate::journal::now().saturating_sub(*at) as f64);
+                        }
+                    }
+                    (0.0, 0.0, now.checked_sub(Duration::from_secs_f64(since.min(age))).unwrap_or(now), true)
                 }
                 None => (0.0, 0.0, now, false),
             };
@@ -208,8 +222,10 @@ fn run(rx: Receiver<Cmd>, mut interval: Duration, mut gpu: bool, out: impl Fn(Ar
                 base_prio: r.base_prio,
                 suspended: r.suspended,
                 cpu: if r.pid == 0 { 0.0 } else { cpu },
+                cpu_time: r.cpu_time,
                 mem: r.private_ws,
                 commit: r.commit,
+                peak_commit: r.peak_commit,
                 ws: r.ws,
                 disk,
                 gpu: pdhs.gpu.get(&r.pid).copied().unwrap_or(0.0),
@@ -252,6 +268,9 @@ fn run(rx: Receiver<Cmd>, mut interval: Duration, mut gpu: bool, out: impl Fn(Ar
             cost_ms - ms(t_pdh)
         );
         out(Arc::new(Snapshot { procs, totals, cost_ms, ncpu, parts, fullscreen }));
+        if tick == 0 {
+            pdh = Pdh::new(gpu);
+        }
         tick += 1;
 
         // Attente jusqu'à la prochaine mesure — ou une commande.

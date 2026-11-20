@@ -1,291 +1,289 @@
 # Vigie — stack technique
 
+Fiche de stack et d'état de Vigie : ce qu'elle fait, comment elle est construite, ses règles de sûreté, ses limites. Les règles communes aux applis sont dans [DIRECTION.md](../DIRECTION.md). Les pistes d'amélioration sont dans [QOL.md](../QOL.md). L'usage (raccourcis, ligne de commande avec exemples) est dans le [README](README.md).
+
+## Glossaire
+
+| Terme | Sens |
+|---|---|
+| **Explorateur** | Explorateur de fichiers maison (`C:\Dev\explorateur`), référence de style des applis. Pas l'Explorateur Windows. |
+| **Socle** | Bibliothèque commune des applis ([Desarrh/socle](https://github.com/Desarrh/socle)) : thème, icônes, palette Ctrl+K, autocomplétion, instance unique, journal de plantage, mode test. Compilée dans l'exe. |
+| **Ultimate** | Launcher de jeux maison (`C:\Dev\Launcher`) qui pilote Vigie en ligne de commande. Rien à voir avec le plan d'alimentation Windows « Ultimate Performance ». |
+| **Fantôme** | Processus qui occupe de la RAM sans servir : serveur de dev oublié, orphelin, démon de build inactif, app connue sans fenêtre, VM WSL, Docker inactif. |
+| **Sûr** | Fantôme pré-coché : orphelin ou démon conçu pour se relancer, inactif depuis plusieurs minutes, ou app connue sans aucune fenêtre (règles dans `hunter.rs`). |
+| **Mise en veille** (d'une app) | Vider sa RAM sans la fermer (`K32EmptyWorkingSet`) : elle continue de tourner et relit ses pages quand elle en a besoin. |
+| **Sieste** (d'un projet) | Suspendre (`NtSuspendProcess`) et mettre en veille tous les processus d'un projet `C:\Dev\X`. **Réveil** : reprise (`NtResumeProcess`) puis préchargement de la mémoire (`PrefetchVirtualMemory`). |
+| **Purge du cache** | Vider la liste « mémoire en veille » du système (`NtSetSystemInformation`, admin). Sans rapport avec la mise en veille d'une app. |
+| **Mode jeu** | Ctrl+G dans l'interface, ou `--avant-jeu` en ligne de commande (même fonction). Il chasse les fantômes sûrs, met en veille les apps en arrière-plan, purge le cache (si admin) et passe en « Performances élevées » si le plan actif n'est pas déjà au maximum. **Fin du mode jeu** (bouton « Quitter » ou `--apres-jeu`) : plan restauré, apps réveillées. |
+| **V1 à V4** | Pistes de [QOL.md](../QOL.md) livrées : V1 tuer par port, V2 sieste de projet, V3 pic de RAM par jeu, V4 boîte noire. |
+| **T1, T2, T4, T5** | Pistes transverses de QOL.md : T1 mode jeu lancé par Ultimate, T2 garde-fou dev avant de jouer, T4 autocomplétion, T5 palette Ctrl+K. |
+| **Règle n°0** | DIRECTION.md §0 : un test ne doit jamais déranger l'utilisateur (pas de fenêtre visible, pas de focus pris, rien sur ses apps ni ses réglages). |
+
 ## 1. But et direction
 
-Vigie est le gestionnaire de tâches Windows de l'utilisateur. Il remplace le Gestionnaire des tâches de Windows (option Ctrl+Maj+Échap) et intègre un **chasseur de RAM fantôme** : il repère ce qui tourne pour rien (serveurs de dev oubliés, orphelins, apps cachées, Docker/WSL) et propose de le nettoyer, surtout avant de jouer.
+### Problème
+Le Gestionnaire des tâches de Windows montre ce qui tourne, mais il ne dit pas ce qui tourne **pour rien**. Or un PC de dev et de jeu accumule des serveurs oubliés, des démons de build, des VM WSL et des apps cachées qui prennent plusieurs Go juste avant de lancer un jeu.
 
-Principes :
-- **Légèreté mesurée** (socle v0.1.4, fenêtre de test invisible qui dessine vraiment, `scratchpad/mesure.ps1`, 60 s au repos) : **fenêtre ouverte** 34,6 Mo privés, ~1 % d'un cœur (une mesure + une image par seconde) ; **fenêtre réduite ou jeu en plein écran** ~13 Mo, **~0,1 % d'un cœur** (une mesure toutes les 10 s, sans compteurs PDH, aucune image). Avant le socle v0.1.3 : 47,8 Mo (police emoji). Exe ~5,8 Mo.
-- **Zéro coût fermé** : pas de service, de tray ni de démarrage auto.
-- **Rien n'est redessiné sans raison** : l'interface attend une mesure ou une action.
-- **Prudence** : dans l'interface, rien n'est tué sans confirmation ou case cochée (la ligne de commande `--avant-jeu` / `--couper-dev` agit sans confirmer : c'est Ultimate qui demande à l'utilisateur). Liste de processus protégés. Services et session 0 jamais proposés.
-- **Même interface que l'Explorateur.**
+### Objectifs
+- Gestionnaire de tâches complet : processus, arbre, CPU, mémoire, disque, GPU, ports, actions.
+- **Chasseur de RAM fantôme** : il montre « X Go récupérables » et nettoie en un clic.
+- **Mode jeu** : préparer la machine avant une partie, puis la rendre telle qu'elle était.
+- Rapidité et légèreté selon DIRECTION.md §2 (mesures en §7).
+- Remplacer Ctrl+Maj+Échap (option, voir §5).
+
+### Non-objectifs
+- Pas de service, d'icône dans la zone de notification ni de démarrage automatique : rien ne tourne quand Vigie est fermée.
+- Pas de gestion des services Windows ni des processus d'autres utilisateurs (session 0 jamais proposée au chasseur).
+- Pas de débit réseau par processus (il faudrait ETW et les droits admin).
+- Pas de mise à jour automatique pour l'instant.
+
+### Invariants de sûreté
+- **Interface** : chaque action qui termine des processus passe par une confirmation, ou par un clic explicite sur « Nettoyer la sélection » après avoir vu la liste cochée. Concrètement :
+  - Suppr, Maj+Suppr, « Terminer tous les X » et `:port` puis Suppr dans la palette ouvrent une confirmation (réglable : « Confirmer avant de terminer » est activé par défaut) ;
+  - les cases « sûr » sont pré-cochées, mais rien ne part sans le clic sur « Nettoyer ».
+- **Ligne de commande** : `--avant-jeu` et `--couper-dev` agissent sans confirmer. C'est l'appelant (Ultimate) qui doit montrer la liste à l'utilisateur. `--couper-dev --seulement <clés>` garantit qu'on ne coupe que ce qui a été montré (§5).
+- **Toujours** :
+  - jamais un processus vital (`CRITICAL`), protégé (`PROTECTED`), un agent IA (Claude Code, Claude, Copilot, Codex : `hunter::is_ai_cmd`), Vigie ni la chaîne de processus qui l'a lancée (`qol::ancestors`) ;
+  - jamais un arbre qui a une fenêtre visible, y compris sur un autre bureau virtuel ;
+  - même liste d'intouchables pour le chasseur, la sieste et `--couper-dev`.
+- **Avant chaque action sur un PID** (terminer, suspendre, priorité, mise en veille, préchargement) : la date de création est revérifiée (`GetProcessTimes` comparée à `Key::ctime`). Un PID réutilisé par un autre processus est refusé.
+- Suspendre et endormir relisent l'état réel juste avant d'agir (`sys::suspended_now`) : les suspensions ne s'empilent pas.
 
 ## 2. Stack
 
-- **Langage** : Rust, édition 2024 (rustc 1.99). Crate `vigie` v0.1.0.
-- **Socle commun** : crate `socle` (tag v0.1.4, `https://github.com/Desarrh/socle`, polices par défaut : ni gras ni emoji ; compilé depuis le tag publié ; `.cargo/config.toml` vers `../socle` est présent mais n'est utilisé que si la copie locale a la même version que celle verrouillée), features `ui`, `settings`, `crash`, `instance`, `testmode` : thème, icônes vectorielles, palette Ctrl+K, autocomplétion floue, toasts, raccourcis AZERTY, instance unique, journal de plantage, mode test. `.cargo/config.toml` n'est pas versionné.
-- **Interface** : `egui` 0.37.0, `egui-winit` 0.37.0 (clipboard, links), `winit` 0.30.13.
-- **Rendu CPU** : `softbuffer` 0.4.8 (présentation GDI), `hdrshot-egui-backend` 0.2.0 (rastériseur logiciel, importé comme `egui_software_backend`), `bytemuck` 1. Il n'y a **aucun contexte GPU**.
-- **Données** : `serde` 1 + `serde_json` 1 (réglages, journal, sortie `docker`), `image` 0.25.10 (PNG seulement : icône, captures de debug). `%APPDATA%` est lu directement (pas de crate `dirs`).
-- **API Windows** : `windows-sys` 0.61.2, plus `ntdll` déclaré à la main.
-  - `ntdll` : `NtQuerySystemInformation` (classes 5 = processus, 80 = listes mémoire), `NtSetSystemInformation` (purge de la mémoire en veille), `NtQueryInformationProcess` (ligne de commande, classe 60), `NtSuspendProcess` / `NtResumeProcess`.
-  - Threading : `OpenProcess`, `GetProcessTimes` (date de création contre la réutilisation de PID), `TerminateProcess`, `SetPriorityClass`, `QueryFullProcessImageNameW`, `GetSystemTimes`.
-  - Memory : `VirtualQueryEx` + `PrefetchVirtualMemory` (réveil des apps mises en veille).
-  - ProcessStatus : `K32EmptyWorkingSet`, `K32GetProcessMemoryInfo`.
-  - IpHelper : `GetExtendedTcpTable` et `GetExtendedUdpTable` (ports).
-  - PDH : GPU Engine, GPU Process Memory, GPU Adapter Memory, PhysicalDisk, Network Interface.
-  - WindowsAndMessaging + Dwm : fenêtres visibles (`DwmGetWindowAttribute(DWMWA_CLOAKED)` : une fenêtre sur un autre bureau virtuel compte), `WM_CLOSE`, premier plan.
-  - Power : `PowerGetActiveScheme` / `PowerSetActiveScheme` / `PowerReadFriendlyName`.
-  - Registry : `Image File Execution Options\taskmgr.exe`, clés Run et `StartupApproved` (`RegEnumValueW`, `RegGetValueW`, `RegSetKeyValueW`), `ExpandEnvironmentStringsW`.
-  - Shell : `ShellExecuteExW` « runas », `SHGetFileInfoW` (icônes), `SHQueryUserNotificationState` (jeu ou vidéo en plein écran).
-  - Version : `GetFileVersionInfoW` (descriptions).
-  - Security : jeton, élévation, privilèges.
-- **Dépendances externes**, appelées seulement à la demande :
-  - `docker.exe`, si Docker Desktop tourne ;
-  - `wsl.exe` (`--shutdown`, `--terminate docker-desktop`) ;
-  - `powercfg.exe`, seulement pour recréer le plan « Performances élevées » s'il est masqué.
-- **Build** : `cargo build --release`, avec un profil release `lto = "thin"`, `codegen-units = 4`, `strip`, `panic = "abort"`. `build.rs` intègre l'icône et les métadonnées via `winresource`.
-- **Exe** : `target\release\vigie.exe`, copié dans `dist\Vigie.exe`. Si l'exe est ouvert, il est renommé `Vigie.ancien-HHMMSS.exe` (supprimé dès qu'il n'est plus utilisé).
-- **Tests** : `cargo test --release` (en priorité basse), 24 tests + 1 ignoré (détail en §6).
+- **Langage** : Rust, édition 2024 (rustc 1.99). Crate `vigie` 0.1.0.
+- **Socle** :
+  - version : tag `v0.1.5`, features `ui`, `settings`, `crash`, `instance`, `testmode`, sans la feature `images` (incompatible avec `panic = "abort"`) ;
+  - polices : options par défaut du socle (Segoe UI, Consolas, Segoe UI Symbol ; ni gras ni emoji) ;
+  - surcharge locale : `.cargo/config.toml` (non versionné) remplace le tag par `../socle`, mais seulement quand la copie locale a la même version que celle verrouillée dans `Cargo.lock`.
+- **Interface** : `egui` 0.37, `egui-winit` 0.37 (clipboard, links), `winit` 0.30.13.
+- **Rendu CPU** : `softbuffer` 0.4.8 (présentation GDI), `hdrshot-egui-backend` 0.2.0 (rastériseur logiciel, importé comme `egui_software_backend`), `bytemuck`. Aucun contexte GPU.
+- **Données** : `serde` + `serde_json` (réglages, journal, sortie Docker), `image` 0.25 (PNG seulement : icône, captures de test). `%APPDATA%` est lu directement.
+- **API Windows** : `windows-sys` 0.61.2, plus `ntdll` déclaré à la main. Features de `windows-sys` utilisées :
+  - **ntdll** : `NtQuerySystemInformation` (classe 5 = processus et pics noyau, classe 80 = listes mémoire, admin), `NtSetSystemInformation` (purge du cache), `NtQueryInformationProcess` (ligne de commande, classe 60), `NtSuspendProcess` / `NtResumeProcess` ;
+  - **Threading** : `OpenProcess`, `GetProcessTimes`, `TerminateProcess`, `SetPriorityClass`, `QueryFullProcessImageNameW`, `GetSystemTimes` ;
+  - **Memory / ProcessStatus** : `VirtualQueryEx`, `PrefetchVirtualMemory`, `K32EmptyWorkingSet`, `K32GetProcessMemoryInfo` ;
+  - **IpHelper** : `GetExtendedTcpTable`, `GetExtendedUdpTable` (ports) ;
+  - **PDH** : GPU Engine, GPU Process Memory, GPU Adapter Memory, PhysicalDisk, Network Interface ;
+  - **WindowsAndMessaging + Dwm** : fenêtres visibles (`DWMWA_CLOAKED` : une fenêtre sur un autre bureau virtuel compte comme visible), `WM_CLOSE`, premier plan ;
+  - **Power** : `PowerGetActiveScheme`, `PowerSetActiveScheme`, `PowerReadFriendlyName`, `PowerReadACValueIndex` (état minimal du processeur) ;
+  - **Registry** : IFEO `taskmgr.exe`, clés Run et `StartupApproved` ; `ExpandEnvironmentStringsW` ;
+  - **Shell** : `ShellExecuteExW` « runas », `SHGetFileInfoW` (icônes), `SHQueryUserNotificationState` (plein écran) ;
+  - **Storage** : `GetFileVersionInfoW` (descriptions) ;
+  - **Security** : jeton, élévation, privilèges.
+- **Programmes externes**, seulement à la demande : `docker.exe` (si Docker Desktop tourne), `wsl.exe` (`--shutdown`, `--terminate docker-desktop`), `powercfg.exe` (seulement pour recréer un plan « Performances élevées » masqué).
+- **Windows** : développé et utilisé sur Windows 11 (build 26100). Les appels `ntdll` non documentés existent depuis Windows 8.1, mais ils ne sont validés que sur cette machine. En cas d'échec, Vigie se dégrade sans planter : colonne vide, mémoire en veille masquée, toast d'erreur.
+- **Build** : `cargo build --release` en priorité basse. Profil : `lto = "thin"`, `codegen-units = 4`, `strip`, `panic = "abort"`. `build.rs` intègre l'icône, les métadonnées et la ressource `VigieCli` (§5).
+- **Exe** : `target\release\vigie.exe`, copié dans `dist\Vigie.exe`. Si l'exe est ouvert, il est renommé `Vigie.ancien-HHMMSS.exe` et supprimé à l'installation suivante, une fois libre.
+
+### Alternatives considérées
+
+| Choix | Alternatives écartées | Raison |
+|---|---|---|
+| Rendu CPU (softbuffer) | egui sur wgpu ou OpenGL | Un contexte GPU coûte environ 150 Mo de pilote (mesuré sur l'Explorateur, de 160 à 40 Mo). Vigie ne doit jamais réveiller le GPU pendant un jeu. |
+| egui (via le socle) | Win32 natif, Tauri | Même interface et mêmes composants que les autres applis maison. Tauri apporterait WebView2 (plus de 100 Mo). |
+| `NtQuerySystemInformation` (une lecture pour tous les processus) | Toolhelp + `OpenProcess` par processus, WMI | Une seule lecture noyau (~3 à 8 ms pour ~370 processus) donne CPU, mémoire, E/S, threads, état suspendu et pics. WMI coûte des dizaines de ms et un service. |
+| PDH pour le GPU | D3DKMT (`D3DKMTQueryStatistics`) | PDH donne directement le % par moteur et par PID, comme le Gestionnaire des tâches. D3DKMT est plus fin mais demande d'agréger par adaptateur et par nœud. Coût PDH ~2,6 ms par mesure, coupé en arrière-plan. |
+| `docker.exe` toutes les 20 s, seulement si Docker tourne | API du moteur sur `\\.\pipe\docker_engine` | Plus simple à écrire et déjà testé. La dépendance au PATH est notée en limites. |
+| IFEO `Debugger` sur `taskmgr.exe` | Raccourci clavier global, hook clavier | Seul moyen pour que Ctrl+Maj+Échap et tous les lancements de `taskmgr.exe` ouvrent Vigie. C'est la méthode de Process Explorer. |
+| Copie dans `%ProgramFiles%\Vigie` pour IFEO | Inscrire `dist\Vigie.exe` | `C:\Dev` est modifiable sans droits admin. Inscrire un exe modifiable laisserait n'importe quel programme remplacer ce qui se lance à la place du Gestionnaire. |
 
 ## 3. Architecture
 
-| Fichier | Rôle |
+| Module | Rôle |
 |---|---|
-| `main.rs` | Boucle winit + rendu softbuffer, arguments CLI, instance unique et journal de plantage (socle), mode sans fenêtre `--avant-jeu` / `--apres-jeu`, mode test, captures de debug |
-| `app.rs` | État : réglages (`Settings`), historiques, lignes affichées (arbre/plat, tri, ordre figé), actions, plans de nettoyage et de mode jeu (exécutés par `travail.rs`), journal |
-| `ui.rs` | Tout le dessin : barre d'outils, volet latéral, liste virtualisée, détails, Chasseur, Performances, Démarrage, palette, modales, clavier |
-| `sampler.rs` | Thread de mesure : instantané de tous les processus (CPU, RAM, disque, GPU, ports, fenêtre, inactivité) et détection du plein écran |
-| `sys.rs` | Couche Windows : lecture noyau, chemins/cmdline, fenêtres, ports, kill/suspendre/priorité/veille, UAC, plan d'alimentation, IFEO, icônes |
-| `pdh.rs` | Une requête PDH : GPU par processus et total, mémoire GPU (bornée par l'adaptateur), disque et réseau totaux |
-| `hunter.rs` | Règles du chasseur → liste de `Ghost` (catégorie, raison, RAM de l'arbre, « sûr », remède, règle de liste blanche) |
-| `docker.rs` | Thread qui interroge `docker ps` / `docker stats` toutes les 20 s, seulement si `com.docker.backend.exe` tourne |
-| `startup.rs` | Apps au démarrage : clés Run HKCU/HKLM/WOW64, dossiers Démarrage, activation via `StartupApproved` |
-| `cli.rs` | Interface sans fenêtre pour les autres applis (vue `Vue::assembler` injectable pour les tests) : `--etat-dev`, `--couper-dev`, réveil des apps endormies (JSON) |
-| `qol.rs` | Pistes validées : V2 projets (`project_of`, `projects`), V3 pics des jeux (`is_game_path`, `track_games`, `missing`), V4 boîte noire (`Moment`, top 5 par ressource), tout calculé sur l'instantané |
-| `travail.rs` | Actions longues sur un thread (chasse, mode jeu, fin du mode jeu) à partir d'un plan préparé par l'interface ; état du mode jeu dans `mode-jeu.json` |
-| `journal.rs` | Journal des nettoyages en JSONL (append, lecture des N derniers jours, compactage à 90 jours) |
-| `winfo.rs` | Description lisible d'un exe (ressource `FileDescription`) |
+| `main.rs` | Boucle winit + rendu softbuffer, arguments de ligne de commande, instance unique et journal de plantage (socle), mode sans fenêtre, mode test, captures |
+| `app.rs` | État et actions : réglages, historiques, lignes affichées (arbre, tri, ordre figé), plans de nettoyage et de mode jeu, journal |
+| `ui.rs` | Dessin : barre d'outils, volet latéral, liste virtualisée, détails, vues Chasseur, Performances, Démarrage, palette, modales, clavier |
+| `sampler.rs` | Thread de mesure : instantané de tous les processus, détection du plein écran |
+| `sys.rs` | Couche Windows : lecture noyau, fenêtres, ports, actions vérifiées par date de création, UAC, plan d'alimentation, IFEO, icônes |
+| `pdh.rs` | Compteurs PDH : GPU par processus et total, mémoire GPU (bornée par l'adaptateur), disque et réseau totaux |
+| `hunter.rs` | Chasseur : règles des fantômes, listes `PROTECTED` et `DOCKER_PROCS`, règle IA `is_ai_cmd` |
+| `qol.rs` | Projets (V2), pics des jeux (V3), boîte noire (V4), chaîne d'ancêtres intouchables (`ancestors`) |
+| `travail.rs` | Actions longues sur un thread (chasse, mode jeu, fin du mode jeu) ; état du mode jeu (`mode-jeu.json`) |
+| `cli.rs` | Commandes sans fenêtre pour Ultimate : `--etat-dev`, `--couper-dev`, réveil des apps endormies |
+| `startup.rs` | Apps au démarrage : clés Run, dossiers Démarrage, activation via `StartupApproved`, RAM actuelle |
+| `docker.rs` | Thread Docker : `docker ps` / `docker stats` toutes les 20 s si `com.docker.backend.exe` tourne |
+| `journal.rs` | Journal des nettoyages (JSONL) et relevé d'inactivité entre deux sessions |
+| `winfo.rs` | Description lisible d'un exe (`FileDescription`) |
 
-**Threads**
-- **Interface** (winit) : en `ControlFlow::Wait`, il ne redessine que sur un événement, une mesure reçue, ou un `request_repaint` (toast, icône).
-- **« echantillonnage »** : boucle mesure → envoi `Arc<Snapshot>` par `mpsc` → réveil de la boucle (`UserEvent::Sample`, pas `request_repaint` : egui ne relaie plus les demandes quand aucune image n'est dessinée). Fenêtre réduite : la mesure est traitée sans dessiner (pics des jeux V3, boîte noire V4, chasseur restent à jour). Il attend ensuite sur `recv_timeout` du canal de commandes (intervalle, GPU, mesure immédiate, arrière-plan). Fenêtre réduite : au moins 10 s entre deux mesures (`BACKGROUND_INTERVAL`), compteurs PDH (GPU, disque, réseau) coupés, ports une mesure sur trois.
-- **« travail »** (à la demande) : exécute un plan (`travail::Travail`) — kill d'arbres, `wsl --shutdown`, `docker stop`, purge, plan d'alimentation, réveil — et renvoie un `Fini` (toast + journal). L'interface ne bloque jamais.
-- Jeu ou vidéo **en plein écran** (`SHQueryUserNotificationState` : D3D plein écran, occupé, présentation) : même régime que la fenêtre réduite, mesure traitée sans dessin.
-- **« icones »** : il reçoit les chemins d'exe et renvoie l'icône RGBA et la description. Chaque chemin n'est chargé qu'une fois.
-- **« docker »** : il dort 5 s tant que Docker est arrêté, puis interroge toutes les 20 s.
+### Threads
+- **Interface** (winit, `ControlFlow::Wait`) : ne dessine que sur un événement, une mesure reçue ou une demande egui (toast, icône).
+- **Mesure** : une mesure par seconde, envoyée par `mpsc`, puis réveil direct de la boucle (`UserEvent::Sample`). Ce n'est pas `request_repaint`, car egui ne relaie plus les demandes de dessin quand aucune image n'est dessinée (fenêtre réduite).
+- **Travail** (à la demande) : exécute un plan (`travail::Travail`) et renvoie un résultat (`Fini`) affiché en toast. L'interface ne bloque pas pendant `wsl --shutdown`, `docker stop`, les kills ou le plan d'alimentation.
+- **Icônes** : charge une fois chaque icône d'exe et sa description.
+- **Docker** : dort 5 s tant que Docker est arrêté, interroge toutes les 20 s sinon.
 
-**Flux de données**
-- `Snapshot` → `App::on_snapshot` : historiques (120 points), boîte noire (V4), `hunter::hunt`, projets (V2), suivi des jeux (V3), candidats d'autocomplétion (si les processus ont changé), table RAM du Démarrage (si la vue est ouverte), puis `rows_dirty`.
-- `rebuild_rows()` ne tourne que si quelque chose a changé.
-- Les actions de l'interface sont empilées dans `actions: Vec<Action>`, puis appliquées après le dessin (`apply_actions`), comme dans l'Explorateur.
+### Régime arrière-plan
+Quand la fenêtre est réduite, ou qu'un jeu ou une vidéo est en plein écran (`SHQueryUserNotificationState`) :
+- une mesure toutes les 10 s (`BACKGROUND_INTERVAL`) ;
+- pas de compteurs PDH (dernières valeurs gardées) ;
+- ports une mesure sur trois ;
+- chaque mesure est traitée sans dessiner : pics des jeux, boîte noire et chasseur restent à jour.
+
+Les compteurs PDH sont créés **après** la première mesure (leur initialisation prend plusieurs centaines de ms) : la fenêtre a ses données tout de suite.
+
+### Flux de données
+- `Snapshot` → `App::on_snapshot` : historiques (120 points), boîte noire, chasseur, projets, suivi des jeux, candidats d'autocomplétion (si les processus ont changé), table RAM du Démarrage (si la vue est ouverte), relevé d'inactivité (toutes les 5 min).
+- `rebuild_rows()` ne tourne que si quelque chose a changé. Les minuscules ne sont calculées qu'une fois par mesure, et seulement si une recherche ou le tri par nom en a besoin.
+- Les actions de l'interface sont empilées (`actions`) puis appliquées après le dessin, comme dans l'Explorateur.
+
+### Inactivité
+- Mesurée depuis l'ouverture de Vigie.
+- Au lancement, elle est estimée :
+  - par le relevé de la session précédente (`releve.json` : un même processus avec le même temps CPU est inactif depuis au moins la fermeture) ;
+  - sinon par le CPU moyen sur la vie du processus.
+- Les estimations sont affichées avec « ≈ ».
 
 ## 4. Direction artistique
 
-Elle vient du **socle** (`socle::theme`, `socle::icons`, `socle::ui`) depuis la migration : plus de copie locale de `theme.rs`. Les 20 couleurs sont celles de l'Explorateur, identiques à avant.
+Même direction artistique que l'Explorateur, fournie par le socle : thème (19 rôles, sombre et clair), icônes vectorielles, composants (contrôle segmenté, palette, champ d'autocomplétion, toasts, modales). Référence des couleurs : `socle::theme` et `explorateur/STACK.md` §4 (non recopiées ici).
 
-| Rôle | Sombre (défaut) | Clair |
-|---|---|---|
-| `bg` (fond de fenêtre) | `#0F1B2D` | `#EFE6D3` |
-| `chrome` (barre d'outils, barre d'état) | `#0B1525` | `#E4D8BF` |
-| `surface` (zone centrale) | `#13223A` | `#F5EDDC` |
-| `side` (volet latéral, volet de détails, cartes) | `#101D31` | `#EEE4CF` |
-| `code` (champs, fond des graphiques) | `#0D182A` | `#F7F0E1` |
-| `border` | `#243756` | `#D6C8AA` |
-| `soft` (segmenté, badges, boutons) | `#1C2D48` | `#E8DCC3` |
-| `text` | `#E7ECF4` | `#2A2620` |
-| `muted` | `#9FB0C8` | `#625846` |
-| `accent` (bleu : sélection, CPU, boutons principaux) | `#6FA8FF` | `#2E5E9E` |
-| `on_accent` | `#0B1525` | `#FFFFFF` |
-| `live` (orange : fantômes, RAM récupérable, GPU, cellules chaudes) | `#F2A65A` | `#A9561A` |
-| `add` (vert : mémoire, « sûr », récupéré) | `#7FD49C` | `#2F7346` |
-| `del` (rouge : Terminer, disque, erreurs) | `#F0A7A7` | `#A83434` |
-| `add_bg` / `del_bg` / `live_bg` | `#123024` / `#341C24` / `#2A2420` | `#E0EBD6` / `#F2DCD4` / `#F1DFC4` |
-| `sel_bg` / `hover_bg` | `#23406B` / `#182A44` | `#D5DDE6` / `#EBE1CB` |
-
-**Polices** (chargées depuis `C:\Windows\Fonts`)
-- `segoeui.ttf` pour le texte, `consola.ttf` pour le monospace (PID, ports, ligne de commande).
-- `seguisym.ttf` (symboles : flèches, ≈) en secours.
-- Ni `segoeuib.ttf` (gras) ni `seguiemj.ttf` (emoji, 13 Mo de RAM) : options du socle désactivées par défaut depuis v0.1.3. La famille « bold » est un alias de Segoe UI.
-
-**Tailles**
-- 13,5 : noms dans la liste.
-- 12,5 : valeurs.
-- 11 : en-têtes de colonnes en MAJUSCULES.
-- 11–11,5 : titres de section en MAJUSCULES, gras, couleur `muted` (comme le volet latéral de l'Explorateur).
-- 12 : barre d'état.
-- 14 : lignes du chasseur et du démarrage.
-- 15 : titres des cartes.
-- 17 : saisie de la palette.
-- 22–28 : grands chiffres (« X Go récupérables »).
-
-**Arrondis**
-- Widgets : 6 (`theme::apply`). Menus : 8. Fenêtres : 10.
-- Lignes de liste : 6. Éléments du volet latéral : 7. Recherche et lignes du chasseur : 8. Contrôle segmenté : 9 (intérieur transparent).
-- Cartes Performances : 10. Carte principale du chasseur et palette : 12. Badges : 8–9.
-
-**Espacements**
-- `item_spacing` 8×6 et `button_padding` 10×5, réglés dans `App::new` comme dans l'Explorateur. Différences : délai des info-bulles 0,35 s, et `selectable_labels` n'est pas désactivé (il l'est dans l'Explorateur).
-- Lignes de 28 px (`ROW_H`), comme l'Explorateur, avec un retrait horizontal de 6 px pour le fond arrondi.
-- Barre d'outils : marges 12×8. Volet latéral : 10×14. Barre d'état : 14×5.
-- Vues Chasseur et Démarrage : 24×18. Performances : 20×16.
-
-**Icônes**
-- **Icônes vectorielles du socle** (grille 24, trait 1,8, couleur du thème), plus aucun emoji : `ListView`, `Ghost`, `Chart`, `Power` (vues), `Gamepad`, `Broom`, `Shield`, `Sun`/`Moon`, `More`, `Tree`, `Pause`, `ChevronUp/Down/Right`, `Folder`, `Check`, `Refresh` ; catégories du chasseur : `Code`, `Block`, `Settings`, `Eye`, `Sleep`, `Container`, `Terminal`. Boutons via `icons::button` (32 px, `Look::tool` / `Look::active`) et `icons::wide`.
-- Les vraies icônes des exe sont extraites via le shell : 16 px dans la liste, 18 px dans le chasseur et le démarrage.
-- Logo : `assets/make_icon.py`. Carré crème arrondi, courbe d'activité bleue `#2E5E9E`, point orange `#F28C32`. Il reprend les couleurs de l'icône de l'Explorateur.
-
-**Repris de l'Explorateur à l'identique**
-- Palette et `theme::apply`.
-- Panneaux `Panel::top/left/bottom` et `CentralPanel`.
-- Contrôle segmenté (fond `soft`, segment actif `Palette::seg_on()` du socle).
-- Champ de recherche (`code` + bordure, arrondi 8, loupe).
-- Bouton thème (`Icon::Sun` / `Icon::Moon`) et menu `Icon::More` à droite.
-- En-têtes de colonnes cliquables avec `Icon::ChevronUp` / `ChevronDown`.
-- Liste virtualisée `show_rows`.
-- Contrôle segmenté, palette Ctrl+K, champ de recherche avec autocomplétion et toasts : composants du socle (`socle::ui::{segmented, Palette, autocomplete_field, Toasts}`).
-- Modales `Window` centrées (bouton destructif sur `del`).
-- Toasts dans la barre d'état, rendu softbuffer, journal de plantage dans `%APPDATA%`.
-
-**Ce qui diffère**
-- Pas d'onglets. La barre d'outils est en `chrome`, alors que l'Explorateur a les onglets en `chrome` et la barre d'outils en `surface`.
-- Les vues sont dans le contrôle segmenté.
-- Cellules colorées selon la charge : `live` × alpha 0,05 à 0,45.
-- Graphiques en aire (ligne de 1,5 px + remplissage alpha 0,22).
-- Interrupteurs maison dans Démarrage.
-- Thème sombre par défaut (`Settings::default`).
+Ce qui est propre à Vigie :
+- Pas d'onglets. Les quatre vues (Processus, Chasseur, Performances, Démarrage) sont dans le contrôle segmenté, et la barre d'outils est en `chrome`.
+- Cellules du tableau colorées selon la charge (`live`, alpha 0,05 à 0,45).
+- Graphiques en aire (ligne 1,5 px + remplissage alpha 0,22).
+- Interrupteurs personnalisés dans la vue Démarrage.
+- Pas de gras réel : la famille `bold` est un alias de Segoe UI (police grasse non chargée, économie de RAM). Les titres de section sont en MAJUSCULES `muted`.
+- Icônes des exe extraites par le shell (16 px dans la liste, 18 px dans le chasseur et le démarrage).
+- Logo : `assets/make_icon.py` (carré crème, courbe d'activité bleue, point orange).
 
 ## 5. Conventions
 
-**Raccourcis**
-
-| Touche | Action |
+### Fichiers (`%APPDATA%\Vigie\`, ou `VIGIE_DATA_DIR`)
+| Fichier | Contenu |
 |---|---|
-| Ctrl+K (Ctrl+P en alias) | Palette de commandes du socle : floue, récents en tête, « Aller à X », « Terminer tous les X » |
-| Ctrl+F ou taper | Recherche |
-| Ctrl+1 / 2 / 3 / 4 | Vues Processus / Chasseur / Performances / Démarrage — touche physique (`socle::keys`), marche en AZERTY |
-| Ctrl+Maj+P / F / G / D | Mêmes vues (alias par lettres) |
-| Ctrl+T | Arbre / liste à plat |
-| ↑↓ PgPréc PgSuiv Début Fin (+Maj) | Naviguer, étendre la sélection |
-| ← → | Replier / déplier |
-| Entrée | Basculer vers la fenêtre |
-| Suppr / Maj+Suppr | Terminer / terminer l'arbre |
-| Espace | Suspendre |
-| Ctrl+E | Ouvrir l'emplacement |
-| Ctrl+C / Ctrl+Maj+C | Copier nom et PID / copier le chemin |
-| Ctrl+A | Tout sélectionner |
-| Ctrl+G | Mode jeu |
-| F5 | Mesurer maintenant |
-| F1 | Aide |
-| Échap | Effacer la recherche ou la sélection |
+| `settings.json` | Réglages (serde, champs manquants tolérés), liste blanche, historique de recherche, pics des jeux. Écriture atomique. Sauvegardé à la fermeture, à chaque changement de liste blanche, et pour les pics au plus toutes les 30 s. |
+| `mode-jeu.json` | Mode jeu actif et plan d'alimentation à restaurer. Géré seulement par le mode jeu. Un ancien `prev_power` de `settings.json` est migré une fois. |
+| `veille.json` | Apps mises en veille par le mode jeu (`pid`, date de création), fusionné d'un mode jeu à l'autre, consommé par la fin du mode jeu. |
+| `releve.json` | Temps CPU de chaque processus à la fermeture (et toutes les 5 min), pour l'inactivité au lancement suivant. |
+| `journal.jsonl` | Nettoyages : `tué`, `chassé`, `coupé`, `sieste`, `veille`, `cache`. 90 jours. |
+| `dernier-jeu.txt`, `crash.log` | Dernier résumé du mode jeu, plantages (socle, signalés par un toast au lancement suivant). |
 
-**Fichiers** (`%APPDATA%\Vigie\`)
-- `settings.json` : JSON indenté, `#[serde(default)]` donc tolérant aux champs manquants. Écriture atomique (`.tmp` + rename). Sauvegardé à la fermeture, après chaque modification de liste blanche, et pour les pics des jeux (au plus toutes les 30 s).
-- `mode-jeu.json` (mode jeu actif, plan à restaurer), `veille.json` (apps endormies par le mode jeu), `journal.jsonl` (catégories `tué`, `chassé`, `coupé`, `sieste`, `veille`, `cache`), `dernier-jeu.txt`, `crash.log`.
+Lancée depuis l'app Claude (MSIX), une commande écrit ses nouveaux fichiers d'AppData dans le dossier `LocalCache` du paquet. Pour les tests, on utilise `VIGIE_DATA_DIR` sous `C:\Dev\vigie\target\` ; pour relancer la vraie Vigie, `explorer.exe "C:\Dev\vigie\dist\Vigie.exe"`.
 
-**Code**
-- Commentaires et textes d'interface en français, avec une typographie soignée (’ « » · espace insécable fine).
+### Ligne de commande
+
+| Commande | Effet | Sortie | UAC |
+|---|---|---|---|
+| `--avant-jeu [--json]` | Mode jeu sans fenêtre (~1,5 s : deux mesures pour connaître l'inactivité) | résumé, ou `{"message","libere","reveilles"}` | non (purge du cache seulement si déjà admin) |
+| `--apres-jeu [--json]` | Fin du mode jeu (~20 ms) | idem | non |
+| `--etat-dev` | Serveurs de dev, Docker, WSL (~20–30 ms) | `{"v":1,"items":[{kind,label,pids,ram_mo,cle,ports,projet}],"total_mo","ms"}` | non |
+| `--couper-dev [--serveurs] [--docker] [--wsl] [--seulement c1,c2] [--json]` | Arrête ce qui est demandé ; avec `--seulement`, uniquement les clés `cle` renvoyées par `--etat-dev` (`pid:ctime` vérifié, `docker`, `wsl`) | résumé d'une ligne, ou JSON ; code 2 en cas d'erreur | non (ce qui demande l'admin est sauté et signalé) |
+| `--memoire-jeu <exe ou dossier>` | Pic de RAM connu du jeu (le plus gros exe sous un dossier), manque actuel | `{"v":1,"connu","nom","exe","chemin","pic_mo","disponible_mo","manque_mo"}` | non |
+| `--set-taskmgr on\|off` | Instance élevée éphémère : copie et clé IFEO | — | oui |
+
+- **Marqueur `VigieCli`** : `build.rs` est la source de vérité. La ressource de version de l'exe liste les commandes comprises (aujourd'hui `avant-jeu apres-jeu etat-dev couper-dev memoire-jeu memoire-jeu-dossier couper-dev-seulement`). Ultimate la lit avant d'appeler une commande. Toute nouvelle commande y est ajoutée.
+- **Qui peut appeler** : tout processus de la session de l'utilisateur, avec ses propres droits. Ces commandes ne donnent aucun droit de plus que ceux qu'il a déjà (terminer ses propres processus). Ce sont les intouchables du §1 qui limitent les dégâts d'un appel non désiré.
+
+### Élévation et Gestionnaire des tâches
+- Vigie démarre sans admin. « Relancer en admin » fait `ShellExecuteEx runas` avec `--after-elevate`, puis l'instance actuelle se ferme.
+- **Remplacer le Gestionnaire des tâches** (option, **non testée en conditions réelles**, §6) :
+  - l'instance élevée copie l'exe dans `%ProgramFiles%\Vigie\Vigie.exe` et inscrit ce chemin dans IFEO ; « off » efface la clé et la copie ;
+  - l'instance non élevée vérifie ensuite la clé et la présence de la copie (cela détecte une écriture redirigée) ;
+  - au lancement, un thread compare l'exe à la copie. Si elles diffèrent, un toast le signale et la palette propose « Mettre à jour la copie du Gestionnaire » (UAC).
+- **Récupération** si Vigie ne démarre plus via Ctrl+Maj+Échap : `Vigie.exe --set-taskmgr off`, ou dans un terminal admin `reg delete "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\taskmgr.exe" /v Debugger /f`.
+- Instance unique (socle, mutex + tube nommé) : une deuxième instance ramène la fenêtre. Ignorée en mode test et juste après une élévation.
+
+### Code
+- Commentaires et textes en français. Apostrophe ’, guillemets « », espace fine insécable avant ; : ! ?.
 - Doc `//!` en tête de chaque module.
-- Pas de `unwrap` sur les appels système : `Option` / `Result<_, String>` avec un message lisible (« accès refusé — relance Vigie en admin… »), affiché en toast rouge.
-- Handles Windows fermés par un `Drop`.
+- Pas de `unwrap` sur les appels système : `Result<_, String>` lisible, affiché en toast rouge. Handles fermés par `Drop`.
 
-**Lancement et UAC**
-- Exe portable, sans installation, instance unique du socle (`socle::instance`, mutex + tube nommé) : une 2e instance (Ctrl+Maj+Échap, raccourci) ramène la fenêtre. Ignorée en mode test et juste après une élévation.
-- Plantages : `socle::crash` (`%APPDATA%\Vigie\crash.log`), signalés par un toast au lancement suivant.
-- Démarre sans admin. « Relancer en admin » fait `ShellExecuteEx runas` avec `--after-elevate`, puis l'instance actuelle se ferme.
-- `--set-taskmgr on|off` : instance élevée éphémère qui écrit la clé IFEO.
-- `--avant-jeu` / `--apres-jeu` (`--json` en option) : sans fenêtre. `--apres-jeu` n'ouvre ni egui ni thread de mesure (~20 ms).
-- `--etat-dev` (1 ligne JSON `{"v":1,"items":[{kind,label,pids,ram_mo,…}],"total_mo"}`, format défini avec Ultimate, ~20–30 ms) et `--couper-dev [--serveurs] [--docker] [--wsl] [--json]` (résumé d'une ligne, sans UAC) : garde-fou dev T2 (`src/cli.rs`, exemples dans le README). Ne touche jamais un arbre avec fenêtre visible, l'appelant et ses ancêtres, Ultimate.exe.
-- **Remplacer le Gestionnaire des tâches** : l'instance élevée (`--set-taskmgr on`) copie l'exe dans `%ProgramFiles%\Vigie\Vigie.exe` et inscrit **ce chemin-là** dans IFEO (un exe sous `C:\Dev\…` est modifiable sans admin : l'inscrire ouvrirait une porte). « off » efface la clé et la copie. L'instance non élevée vérifie ensuite la clé et la présence de la copie (détecte une écriture redirigée). Limite : la copie de Program Files ne se met pas à jour toute seule (recocher l'option après une mise à jour).
-- **Mode jeu** : l'état (`actif`, plan d'alimentation à restaurer) est dans `%APPDATA%\Vigie\mode-jeu.json`, géré seulement par le mode jeu ; un ancien `prev_power` de settings.json est migré une fois.
-- **Virtualisation MSIX** : lancés depuis l'app Claude, nos processus écrivent les nouveaux fichiers d'AppData dans `…\Packages\Claude_…\LocalCache`. Tests et données de test sous `C:\Dev\vigie\target\` ; pour relancer la vraie Vigie : `explorer.exe "C:\Dev\vigie\dist\Vigie.exe"`.
-- Ressource de version `VigieCli` = « avant-jeu apres-jeu etat-dev couper-dev memoire-jeu memoire-jeu-dossier » (`build.rs`) : Ultimate y vérifie les commandes comprises avant de les appeler. **Toute nouvelle commande sans fenêtre doit y être ajoutée.**
-- `--memoire-jeu <exe | dossier d'installation>` : `{"v":1,"connu":true,"nom","exe","chemin","pic_mo","disponible_mo","manque_mo"}` (V3) ; avec un dossier, le plus gros pic connu sous ce dossier (marqueur `memoire-jeu-dossier`).
-- `%APPDATA%\Vigie\veille.json` : apps endormies par `--avant-jeu`, consommé par `--apres-jeu`.
+### Tests et mesures (règle n°0)
+- `cargo test --release` : 25 tests et 1 ignoré, celui qui écrit une entrée factice dans `HKCU\…\Run`, désactivé pour ne pas toucher au registre de l'utilisateur. Les tests qui lancent des processus jetables sont sérialisés (`TEST_PROCESSUS`).
+- `tools\mesure.ps1 [-reduite]` : RAM et CPU au repos, fenêtre de test invisible.
+- `--avant-jeu` et `--couper-dev` agissent sur les vraies apps : on ne les teste qu'avec des cibles factices et `VIGIE_DATA_DIR`.
 
-**Debug / tests** (règle n°0 : ne jamais déranger l'utilisateur) : `VIGIE_CAPTURE=x.png` rend l'interface hors écran sans créer de fenêtre (egui + rendu logiciel dans un tampon, priorité basse), options `VIGIE_VIEW`, `VIGIE_SELECT`, `VIGIE_PALETTE`, `VIGIE_GAME`, `VIGIE_BB`, `VIGIE_SIZE`, `VIGIE_DUMP`. `VIGIE_DATA_DIR` redirige réglages, journal, veille.json et mode-jeu.json vers un dossier de test. `--test-hors-ecran` (socle) ouvre une vraie fenêtre invisible, sans focus et en priorité basse, pour mesurer RAM et CPU ; `VIGIE_TEST_REDUIT=1` la réduit sans l'activer (mesure du régime arrière-plan).
+| Variable / option | Effet |
+|---|---|
+| `--test-hors-ecran` | Fenêtre réelle mais invisible (opacité 0), sans focus, hors de la barre des tâches, en priorité basse (socle) |
+| `VIGIE_TEST_REDUIT=1` | Avec `--test-hors-ecran` : fenêtre réduite sans activation (régime arrière-plan) |
+| `VIGIE_DATA_DIR=dossier` | Réglages et fichiers de données dans ce dossier |
+| `VIGIE_CAPTURE=x.png` | Rendu de l'interface en mémoire, sans fenêtre, enregistré en PNG |
+| `VIGIE_VIEW`, `VIGIE_SELECT`, `VIGIE_PALETTE`, `VIGIE_GAME=1`, `VIGIE_BB=1`, `VIGIE_SIZE=LxH` | Pour la capture : vue, processus sélectionné, palette ouverte (et pré-remplie), fenêtre du mode jeu, boîte noire épinglée, taille |
+| `VIGIE_DUMP=nom.exe` | Pour la capture : détail des processus de ce nom et des fantômes dans `x.png.txt` |
+| `VIGIE_TRACE_DEMARRAGE=1` | Écrit sur stderr le temps jusqu'à la première image avec des données |
 
-## 6. Fonctionnalités
+## 6. Fonctionnalités et vérification
 
-**V1 (vérifiée)**
-- Liste des processus en arbre ou à plat, avec un total quand un nœud est replié.
-- Colonnes : statut (App / Fond / Système / Suspendu / Fantôme + priorité), CPU, mémoire privée, disque, GPU, mémoire GPU, ports, threads, PID.
-- Recherche par nom, description, PID, titre, ligne de commande ou `:port`. Tri, multi-sélection.
-- Ordre figé tant que la souris survole la liste.
-- Volet de détails : graphiques, chemin, ligne de commande, parent, ports cliquables.
-- Actions : terminer, terminer l'arbre, fermer proprement, suspendre, priorité, emplacement (ouvert dans l'Explorateur maison s'il existe), copier, recherche web.
-- Chasseur : serveurs de dev, orphelins, démons de build, apps en fond, lourds inactifs, VM WSL. Pré-coche « sûr », liste blanche. Inactivité estimée au lancement (« ≈ »).
-- Vue Performances (CPU, mémoire engagée/en veille, GPU, disque, réseau) et top consommateurs.
-- Mode « avant de jouer » : ne rétrograde jamais un plan déjà au maximum (l'utilisateur est en Ultimate Performance).
-- Palette de commandes Ctrl+K (socle) ; recherche floue avec autocomplétion (historique, noms, descriptions, `:ports`), Tab pour compléter.
+| Fonction | Vérification |
+|---|---|
+| Lot 1 : liste des processus (arbre ou plat, totaux repliés, tri, recherche floue, ordre figé au survol), colonnes, volet de détails, actions, chasseur, vue Performances, mode jeu, palette | Captures hors écran ; tests du chasseur sur faux instantanés (Edge sans fenêtre sûr, avec fenêtre non proposé, agent IA, ancêtre de Vigie, arbre protégé) ; actions sur processus jetables |
+| Lot 2 : vue Démarrage, mise en veille, journal | Interrupteur sur entrée factice (test ignoré) ; mise en veille sur processus jetable |
+| V1 tuer par port, V2 sieste de projet, V3 pic par jeu, V4 boîte noire | Test sieste/réveil sur un node jetable ; faux jeu dans un faux `steamapps\common` ; captures |
+| T2 `--etat-dev` / `--couper-dev` | Sélection sur vue factice ; arrêt réel limité à un node jetable ; clé `pid:ctime` erronée refusée |
+| T1 mode jeu sur thread, fusion de `veille.json` | Test sur processus jetables, sans purge ni plan d'alimentation |
+| T4 autocomplétion, T5 palette (socle) | Test Ctrl+1–4 en AZERTY simulé dans egui ; recherche chronométrée |
 
-**V2 (vérifiée)**
-- Vue Démarrage, avec la RAM actuelle de chaque app. L'interrupteur est testé sur une entrée factice.
-- Mise en veille sans fermer : testée, 184 Mo libérés sur un processus de test. Aussi dans le mode jeu.
-- Journal des nettoyages.
+**Pas testé en conditions réelles** (avec ce qu'il faudrait faire) :
+- **Docker** : Docker Desktop était arrêté. Il faudrait le démarrer dans une VM avec un conteneur inactif.
+- **Remplacer le Gestionnaire des tâches** : UAC et HKLM. À faire sur une VM ou un compte jetable.
+- **Purge du cache** : demande l'admin, sur une VM.
+- **Mise en veille des vraies apps** de l'utilisateur et **désactivation d'une vraie entrée** de démarrage : seulement avec son accord.
 
-**Étape socle + QoL (vérifiée, tests automatiques et captures hors écran)**
-- Migration sur le socle (thème, icônes vectorielles, palette Ctrl+K, autocomplétion floue, toasts, instance unique, crash, Ctrl+1–4 en AZERTY).
-- V1 tuer par port (`:3000` puis Entrée ou Suppr dans la palette).
-- V2 sieste de projet : test qui endort puis réveille un node jetable ; Vigie et ses parents exclus.
-- V3 pics de RAM par jeu : vérifié avec un faux jeu dans un faux `steamapps\common` ; `--memoire-jeu`.
-- V4 boîte noire : survol + épinglage sur les graphiques Performances.
+## 7. Mesures
 
-**Audit ponytail (corrigé, tests automatiques)**
-- Fenêtre sur un autre bureau virtuel (`DWM_CLOAKED_SHELL`) = vraie fenêtre : Edge sur le bureau 2 n'est plus proposé au chasseur ni à `--avant-jeu`.
-- Suspendre / sieste : état réel relu juste avant (`sys::suspended_now`), plus de suspensions empilées.
-- kill, suspendre, priorité, mise en veille, préchargement : date de création vérifiée (`GetProcessTimes` = `Key::ctime`) contre la réutilisation de PID.
-- Découpages de chaînes en minuscules ASCII (plus de panique sur certains caractères).
-- `veille.json` fusionné (deux modes jeu de suite sans `--apres-jeu` ne perdent rien).
-- Nom du plan d'alimentation par `PowerReadFriendlyName` (plus aucun powercfg, sauf pour recréer un plan masqué).
-- Règles partagées : `hunter::is_ai_cmd` (Claude Code, Claude, Copilot, Codex), `hunter::DOCKER_PROCS`, `qol::ancestors` (intouchables) dans le chasseur, la sieste et `--couper-dev`. `dirs` retiré (`%APPDATA%` lu directement).
-- Démarrage : table RAM calculée à la mesure ; autocomplétion reconstruite seulement si les processus changent ; minuscules calculées une fois par mesure ; « plus gros consommateurs » = top 5 de la boîte noire.
-- Tests : 24 (+1 ignoré) — chasseur sur faux instantanés (Edge sans fenêtre sûr, avec fenêtre non, agent IA non, ancêtre de Vigie non, arbre protégé non), `--couper-dev` (sélection sur vue factice + vrai arrêt limité à un node jetable), mode jeu sur thread avec fusion de veille.json ; les tests qui lancent des processus sont sérialisés (`TEST_PROCESSUS`).
+`tools\mesure.ps1`, Windows 11, 16 threads, 48 Go, ~370 processus, socle v0.1.5, 60 s au repos après 15 s de chauffe :
 
-**Pas testé en vrai**
-- **Docker** : Docker Desktop était arrêté. Seul le parsing est testé.
-- **Remplacement du Gestionnaire des tâches** : demande l'UAC (copie dans Program Files + clé IFEO) ; non exécuté pendant le développement (règle n°0).
-- **Vidage de la mémoire en veille** : nécessite l'admin.
-- **Mise en veille des vraies apps** de l'utilisateur via le mode jeu.
-- **Désactivation d'une vraie entrée** de démarrage.
+| Régime | RAM privée | Plage de travail | CPU (d'un cœur) |
+|---|---|---|---|
+| Fenêtre ouverte (une mesure et une image par seconde) | 35 Mo | 54 Mo | 1 à 2,5 % selon la charge de la machine |
+| Fenêtre réduite (une mesure toutes les 10 s, aucune image) | 13 Mo | 27 Mo | 0,08 % |
+| Plein écran | même régime que réduite, non mesuré séparément | | |
 
-## 7. Intégrations
+Objectifs de DIRECTION.md §2 :
+- **Fenêtre utilisable en moins de 300 ms** : première image avec des données en 72 à 123 ms (316 ms quand la machine est à 100 % et Vigie en priorité basse), mesuré avec `VIGIE_TRACE_DEMARRAGE`.
+- **Recherche en moins de 5 ms** : 0,1 à 0,5 ms par frappe sur 400 processus (test `recherche_rapide`).
+- **Réponse à une frappe en moins d'une image** : une image coûte 3 à 5 ms à 1240×780 (barre d'état, « image … ms »). Non mesuré en 4K.
+- **Mesure** : 7 à 30 ms selon la charge (lecture noyau 3 à 8 ms, PDH ~2,6 ms), sur le thread de mesure.
 
-- **Explorateur** (en place) : « Ouvrir l'emplacement » lance `C:\Dev\explorateur\dist\Explorateur.exe` (ou `target\release\explorateur.exe`) sur le dossier de l'exe. Sinon, `explorer /select`.
-- **Launcher Ultimate** (T1, T2 — côté Vigie prêt, branchement fait par la session Ultimate) : `--avant-jeu --json` au lancement d'un jeu, `--apres-jeu --json` à sa fermeture (restaure le plan, réveille les apps endormies) ; `--etat-dev` puis `--couper-dev` pour « Tout couper / Garder ». Si Vigie est absente, Ultimate continue sans rien bloquer (règle 4).
-- **Possibles** :
-  - l'Explorateur affiche « quel processus verrouille ce fichier » via Vigie ;
-  - le lecteur ou le client YouTube se mettent en liste blanche du mode jeu ;
-  - Vigie ouvre un `.log` ou `crash.log` dans le lecteur universel.
+Exe : ~5,9 Mo. La police emoji, retirée depuis le socle v0.1.3, coûtait 13 Mo.
 
-## 8. Limites connues / dette technique
+## 8. Intégrations
 
-- **Fichiers trop gros** : `ui.rs` (1 986 lignes) et `app.rs` (1 254) gagneraient à être découpés par vue.
-- ~~Thème copié dans chaque app~~ : résolu, Vigie utilise le socle.
+- **Explorateur** : « Ouvrir l'emplacement » lance `C:\Dev\explorateur\dist\Explorateur.exe` (ou `target\release\explorateur.exe`) sur le dossier de l'exe. Sinon, `explorer /select`.
+- **Ultimate** (T1, T2) : côté Vigie, c'est prêt. Le branchement est fait par la session Ultimate et n'est pas vérifié ici.
+  - au lancement d'un jeu : `--avant-jeu --json` ;
+  - à sa fermeture : `--apres-jeu --json` ;
+  - garde-fou dev : `--etat-dev`, puis `--couper-dev --seulement <clés montrées>` ;
+  - « Il te manque X Go » : `--memoire-jeu <dossier du jeu>`.
+  - Si Vigie est absente ou ancienne (marqueur `VigieCli`), Ultimate continue sans rien bloquer (DIRECTION.md règle 4).
+
+## 9. Risques et mitigations
+
+| Risque | Impact | Mitigation | État |
+|---|---|---|---|
+| Tuer un processus utile | Perte de données non enregistrées | Confirmation dans l'interface ; intouchables (§1) ; pas d'arbre avec fenêtre ; liste blanche | En place, testé sur faux instantanés |
+| PID réutilisé entre la mesure et l'action | Action sur le mauvais processus | Date de création revérifiée avant chaque action | En place, testé |
+| `--couper-dev` coupe ce qui n'a pas été montré | Serveur apparu entre-temps tué | `--seulement <clés>` (`pid:ctime`) | En place, à brancher côté Ultimate |
+| Identification par nom d'exe (`PROTECTED`, `DEV_TOOLS`) | Faux positif ou usurpation de nom | Intouchables (fenêtre, ancêtres, IA) ; rien de pré-coché hors règles « sûr » ; liste blanche | Accepté (même utilisateur, aucun gain de droits) |
+| IFEO : Vigie absente ou plantée | Plus de Gestionnaire des tâches via Ctrl+Maj+Échap | Copie dans Program Files ; vérification après écriture ; contrôle de version au lancement ; procédure de récupération (§5) | Non testé en conditions réelles |
+| Copie IFEO périmée | Ancienne version derrière Ctrl+Maj+Échap | Contrôle au lancement + toast + commande de mise à jour | En place |
+| Interruption pendant une sieste ou un mode jeu (plantage, fermeture) | Processus restés suspendus, plan non restauré | Au lancement suivant : projets affichés « endormi » avec un bouton Réveiller ; mode jeu restauré depuis `mode-jeu.json` (bouton « Quitter ») ; `--apres-jeu` fonctionne aussi plus tard | En place |
+| Plan perso performant rétrogradé | Moins de performances en jeu | « Déjà au maximum » : GUID connus, puis état minimal du processeur à 100 %, puis nom ; plan restauré en sortie | En place (un plan perso dont l'état minimal du processeur est sous 100 % sera changé, puis restauré à la sortie) |
+| Écriture virtualisée (MSIX) | Réglages invisibles pour l'utilisateur | Données de test sous `C:\Dev\vigie\target` ; relance via `explorer.exe` | En place |
+
+## 10. Limites et dette technique
+
+- `ui.rs` (~2 000 lignes) et `app.rs` (~1 300) gagneraient à être découpés par vue.
 - **Chasseur** :
-  - inactivité mesurée seulement depuis l'ouverture de Vigie (estimation par CPU moyen sur la vie du processus) ;
   - listes de noms codées en dur (`DEV_TOOLS`, `BACKGROUND_APPS`, `PROTECTED`) ;
+  - le marqueur `\games\` de `is_game_path` peut prendre un exe ordinaire pour un jeu ;
   - pas de lecture de la cible des raccourcis `.lnk` du dossier Démarrage.
-- **Compteurs Windows** : mémoire GPU par processus parfois absurde (Windows renvoie p. ex. 597 Go pour `discord_clips`), simplement bornée par le total de l'adaptateur. Le GPU via PDH coûte ~2,6 ms par mesure.
-- **Pas de réseau par processus** (ETW, admin) ni de services Windows.
-- **Clé IFEO** : elle pointe vers la copie de `%ProgramFiles%\Vigie`, qui ne se met pas à jour toute seule : après une mise à jour de Vigie, Ctrl+Maj+Échap ouvre l'ancienne version jusqu'à ce qu'on recoche l'option.
-- **Dépendances CLI** : Docker dépend de `docker.exe` dans le PATH. Le nom du plan est lu par `PowerReadFriendlyName`, mais « déjà au maximum » compare encore ce nom localisé à une liste de mots (« ultimate », « optimal », « élevées »…) : un plan perso au nom libre n'est pas reconnu.
-- **Pas de mise à jour automatique** (l'Explorateur en a une). Dépôt git local, pas encore publié.
-- **Tests** : `--avant-jeu` et `--couper-dev` agissent sur les vraies apps ; ne les tester qu'avec des cibles factices et `VIGIE_DATA_DIR`.
+- **Compteurs Windows** : la mémoire GPU par processus est parfois aberrante (597 Go pour `discord_clips`) ; elle est bornée par le total de l'adaptateur.
+- Docker dépend de `docker.exe` dans le PATH, et un processus est lancé toutes les 20 s quand Docker tourne.
+- Chemins codés en dur vers l'Explorateur (`C:\Dev\explorateur`), avec un repli sur `explorer /select`.
+- Pas de mise à jour automatique (l'Explorateur en a une). Le dépôt git est local, pas encore publié.
 
-## 9. Pistes QoL (non implémentées, à valider)
-
-Règle commune : **rien ne doit ralentir l'ouverture ni l'image.** Tout réutilise l'instantané déjà mesuré chaque seconde (aucun nouvel appel système en boucle). Ce qui coûte un appel Windows n'est lancé qu'à la demande, pour un seul processus, ou sur le thread de mesure.
-
-Types : **[inédite]** = rien de tel dans les gestionnaires connus. **[existe]** = vu dans Process Explorer, System Informer, btop, Process Lasso, Resource Monitor…, mais absent de Vigie.
-
-Le tableau est classé par utilité pour l'utilisateur.
-
-| # | Piste | Type | Pour | Pourquoi ça reste instantané et léger | Effort |
-|---|---|---|---|---|---|
-| 1 | ✅ fait (T4, socle) — **Autocomplétion de la recherche** : liste déroulante de suggestions floues (nom d'exe, description, `:port`, historique), Tab pour compléter, ↑↓ pour choisir | existe (navigateurs, btop filtre) | tous | Recherche par préfixe sur ~350 noms déjà en mémoire, < 0,1 ms par frappe. Historique (200 entrées max, défaut du socle) dans `settings.json` | S |
-| 2 | ✅ fait (V2) — **Sieste de projet** : les processus sont regroupés par projet de dev, déduit du chemin dans la ligne de commande (`C:\Dev\vigie` → « vigie : 4 processus, 1,3 Go »). « Endormir le projet » suspend et met en veille tout l'arbre ; « Réveiller » le relance instantanément, sans rien relancer | inédite | dev | Lignes de commande déjà en cache. Regroupement par préfixe de chemin, une fois par mesure. Suspendre et mettre en veille sont des appels noyau de quelques µs par processus | M |
-| 3 | ✅ fait (V3) — **« Il te manque 3 Go pour ce jeu »** : Vigie retient le pic de RAM de chaque jeu (exe reconnu par son dossier d'installation : Steam, Epic, GOG…). Le mode jeu, la section « Jeux » et `--memoire-jeu` affichent le manque et ce que le chasseur peut récupérer | inédite | jeu | Un nombre par jeu dans `settings.json`. Comparaison avec la RAM libre déjà mesurée : aucun coût à l'exécution | M |
-| 4 | ✅ fait (V4) — **Boîte noire « pourquoi ça a ramé ? »** : clic sur un pic du graphique Performances → les 5 processus responsables à cet instant précis, même s'ils sont morts depuis | inédite (Resource Monitor ne garde rien) | jeu, YouTube | Anneau de 120 × top-5 (PID, nom, CPU, disque) rempli pendant la mesure : ~10 Ko, aucun calcul à l'affichage | S |
-| 5 | ✅ fait (V1) — **Tuer par port** : taper `:3000` dans la palette, puis Entrée ou Suppr, termine ce qui écoute dessus (dans la recherche, `:3000` filtre la liste, puis Suppr agit sur la ligne choisie) (fini les EADDRINUSE) | inédite sous cette forme | dev | Table des ports déjà dans l'instantané ; une seule action | S |
-| 6 | **Naissances / morts surlignées** : vert 2 s pour un nouveau processus, rouge 2 s pour un processus qui disparaît (la ligne reste affichée, barrée) | existe (Process Explorer, System Informer) | tous | Différence de deux ensembles de clés déjà calculée à chaque mesure ; fondu géré par egui, sans mesure supplémentaire | S |
-| 7 | **Viseur « quelle appli est-ce ? »** : glisser une cible sur n'importe quelle fenêtre → sélection de son processus (utile pour une pop-up inconnue ou un overlay) | existe (Process Explorer) | tous | `WindowFromPoint` + `GetWindowThreadProcessId` au relâchement de la souris : 1 appel | S |
-| 8 | **Fantômes qui reviennent** : Vigie repère une app tuée qui réapparaît dans l'heure, et propose de couper sa vraie source (entrée de démarrage, tâche planifiée, service qui la relance) | inédite | jeu, dev | Ensemble des noms tués récemment (déjà dans le journal) comparé aux naissances de l'instantané. Lecture des tâches planifiées seulement quand une résurrection est détectée | M |
-| 9 | **Bouclier premier plan** : pendant un jeu ou une vidéo en plein écran, tout processus d'arrière-plan qui dépasse 20 % de CPU passe en priorité basse, puis revient à la normale à la sortie | existe (Process Lasso ProBalance) | jeu, YouTube | Règle évaluée sur l'instantané existant. `SetPriorityClass` seulement à l'entrée et à la sortie, pas à chaque seconde | M |
-| 10 | **Instantané « avant / après »** : touche B pour marquer, puis colonne Δ RAM et liste des nouveaux processus (parfait après un `npm install` ou un build) | inédite dans un gestionnaire | dev | Copie de (clé, mémoire) des ~350 processus : ~8 Ko ; Δ calculé à la reconstruction des lignes | S |
-| 11 | **Qui verrouille ce fichier ?** : glisser un fichier sur Vigie, ou le demander depuis l'Explorateur, et le processus coupable est sélectionné avec un bouton « Fermer / Terminer » | existe (Process Explorer, PowerToys File Locksmith) | dev | Restart Manager (`RmGetList`) pour ce seul fichier, ~5–20 ms, à la demande. Rien en arrière-plan | S |
-| 12 | **Cœurs CPU en mini-barres** dans le volet latéral (16 barres fines) | existe (btop, Gestionnaire des tâches) | jeu | Un seul appel `SystemProcessorPerformanceInformation` ajouté à la mesure existante (~20 µs) | S |
-| 13 | ~~Brancher le launcher~~ → **fait côté Vigie** (QOL T1/T2) : `--avant-jeu`, `--apres-jeu` avec réveil, `--etat-dev`, `--couper-dev` | intégration | jeu | — | — |
-| 14 | **Débit réseau par processus** (qui télécharge pendant une vidéo ou un match) | existe (Resource Monitor, System Informer) | YouTube, jeu | Session ETW noyau (admin) sur un thread dédié : événements cumulés, lus une fois par mesure. Désactivé sans admin, donc 0 coût | L |
-| 15 | **DLL et handles du processus sélectionné** dans un onglet du volet de détails | existe (Process Explorer) | dev | Lus uniquement à l'ouverture de l'onglet, pour un seul processus, sur un thread ; jamais pour toute la liste | M |
+Pistes ouvertes : voir [QOL.md](../QOL.md). Propositions de Vigie pas encore reportées là-bas :
+- naissances et morts surlignées ;
+- viseur sur une fenêtre ;
+- fantômes qui reviennent ;
+- bouclier premier plan ;
+- instantané « avant / après » ;
+- qui verrouille ce fichier ;
+- mini-barres par cœur ;
+- débit réseau par processus ;
+- DLL et handles ;
+- API Docker par tube nommé.

@@ -222,6 +222,8 @@ pub enum Action {
     GameExit,
     Elevate,
     TaskmgrToggle,
+    /// recopie l'exe en cours dans Program Files (UAC)
+    TaskmgrUpdate,
     SampleNow,
     SetView(View),
     WebSearch(String),
@@ -306,6 +308,9 @@ pub struct App {
     pub game_active: bool,
     pub elevated: bool,
     pub taskmgr: bool,
+    /// la copie de Program Files (Ctrl+Maj+Échap) est d'une autre version
+    pub taskmgr_stale: Arc<std::sync::atomic::AtomicBool>,
+    taskmgr_stale_told: bool,
     pub icons: HashMap<Arc<str>, IconEntry>,
     icon_tx: Sender<Arc<str>>,
     icon_rx: Receiver<(Arc<str>, Option<egui::ColorImage>, Option<String>)>,
@@ -336,6 +341,7 @@ pub struct App {
     job_rx: Receiver<crate::travail::Fini>,
     pub busy: usize,
     peaks_saved: std::time::Instant,
+    releve_saved: std::time::Instant,
 }
 
 impl App {
@@ -424,6 +430,15 @@ impl App {
             game_active,
             elevated: sys::is_elevated(),
             taskmgr: sys::taskmgr_replaced(),
+            taskmgr_stale: {
+                let f = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let f2 = f.clone();
+                if !socle::testmode::enabled() {
+                    std::thread::Builder::new().name("ifeo".into()).spawn(move || f2.store(sys::taskmgr_copy_stale(), std::sync::atomic::Ordering::Relaxed)).ok();
+                }
+                f
+            },
+            taskmgr_stale_told: false,
             icons: HashMap::new(),
             icon_tx,
             icon_rx,
@@ -447,6 +462,7 @@ impl App {
             job_rx,
             busy: 0,
             peaks_saved: std::time::Instant::now(),
+            releve_saved: std::time::Instant::now(),
             s,
         }
     }
@@ -502,6 +518,10 @@ impl App {
         while let Ok((path, img, desc)) = self.icon_rx.try_recv() {
             let tex = img.map(|im| self.ctx.load_texture(format!("ico:{path}"), im, egui::TextureOptions::LINEAR));
             self.icons.insert(path, IconEntry { tex, desc });
+        }
+        if !self.taskmgr_stale_told && self.taskmgr_stale.load(std::sync::atomic::Ordering::Relaxed) {
+            self.taskmgr_stale_told = true;
+            self.toast("Ctrl+Maj+Échap ouvre une ancienne copie de Vigie : Ctrl+K → « Mettre à jour la copie du Gestionnaire »", true);
         }
         while let Ok(f) = self.job_rx.try_recv() {
             self.job_done(f);
@@ -614,6 +634,11 @@ impl App {
         }
         if self.startup.is_some() && self.s.view == View::Startup {
             self.startup_ram = crate::startup::ram_table(self.startup.as_deref().unwrap_or(&[]), &snap.procs);
+        }
+        // relevé d'inactivité toutes les 5 min (et à la fermeture) : survit à un plantage
+        if !self.headless && self.releve_saved.elapsed() > Duration::from_secs(300) {
+            crate::journal::Releve::save(&snap.procs);
+            self.releve_saved = std::time::Instant::now();
         }
         self.lower_ok = false;
         self.snap = Some(snap);
@@ -947,6 +972,13 @@ impl App {
                     Err(e) => self.toast(e, true),
                 }
             }
+            Action::TaskmgrUpdate => match sys::set_taskmgr(true) {
+                Ok(()) => {
+                    self.taskmgr_stale.store(false, std::sync::atomic::Ordering::Relaxed);
+                    self.toast("Copie du Gestionnaire des tâches mise à jour", false);
+                }
+                Err(e) => self.toast(e, true),
+            },
             Action::SampleNow => self.sample_now(),
             Action::SetView(v) => self.s.view = v,
             Action::Trim(keys) => {
@@ -1251,4 +1283,55 @@ pub fn human_rate(b: f64) -> String {
 
 pub fn pct(v: f32) -> String {
     if v < 0.05 { "0 %".into() } else if v < 10.0 { format!("{v:.1} %").replace('.', ",") } else { format!("{v:.0} %") }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sampler::Totals;
+
+    /// Objectif DIRECTION.md : recherche < 5 ms. 400 faux processus, frappe de « node », puis « :51 ».
+    #[test]
+    fn recherche_rapide() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, Settings::default());
+        let procs: Vec<Proc> = (0..400u32)
+            .map(|i| Proc {
+                key: Key { pid: 1000 + i, ctime: i as i64 },
+                ppid: if i % 7 == 0 { 0 } else { 1000 + i - 1 },
+                parent: if i % 7 == 0 { None } else { Some(Key { pid: 999 + i, ctime: i as i64 - 1 }) },
+                name: Arc::from(format!("{}.exe", ["node", "chrome", "code", "python", "svchost"][i as usize % 5]).as_str()),
+                path: None,
+                cmd: Some(Arc::from(format!(r"C:\Dev\projet{}\serveur.js --port {}", i % 9, 5000 + i).as_str())),
+                session: 1,
+                threads: 8,
+                handles: 100,
+                base_prio: 8,
+                suspended: false,
+                cpu: (i % 13) as f32,
+                cpu_time: 0,
+                mem: (i as u64) << 20,
+                commit: 0,
+                peak_commit: 0,
+                ws: 0,
+                disk: 0.0,
+                gpu: 0.0,
+                gpu_mem: 0,
+                window: None,
+                ports: Arc::from(vec![crate::sys::Port { tcp: true, port: 5000 + i as u16, local_only: true }]),
+                idle_secs: 0.0,
+                age_secs: 0.0,
+                idle_min: false,
+            })
+            .collect();
+        app.on_snapshot(Arc::new(Snapshot { procs, totals: Totals::default(), cost_ms: 0.0, ncpu: 8, parts: String::new(), fullscreen: false }));
+        for q in ["n", "no", "nod", "node", ":51"] {
+            app.filter = q.into();
+            let t0 = std::time::Instant::now();
+            app.rebuild_rows();
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            eprintln!("recherche « {q} » : {ms:.2} ms, {} lignes", app.rows.len());
+            assert!(ms < 5.0, "« {q} » : {ms:.2} ms");
+        }
+    }
 }

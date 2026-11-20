@@ -1411,7 +1411,11 @@ impl App {
         }
         let ctx = ui.ctx().clone();
         let mut open = true;
+        let muted = self.pal.muted;
         egui::Window::new("Raccourcis clavier").open(&mut open).collapsible(false).resizable(false).show(&ctx, |ui| {
+            // « À propos » : versions de Vigie et du socle compilé dedans
+            ui.label(RichText::new(format!("Vigie {} · socle {}", env!("CARGO_PKG_VERSION"), socle::VERSION)).size(11.5).color(muted));
+            ui.add_space(4.0);
             egui::Grid::new("keys").num_columns(2).spacing(vec2(24.0, 4.0)).show(ui, |ui| {
                 for (k, v) in [
                     ("Ctrl+K (ou Ctrl+P)", "Palette de commandes"),
@@ -1464,6 +1468,9 @@ impl App {
         }
         if !self.elevated {
             v.push(Command::new("elevate", "Relancer en administrateur").group("Système").icon(Icon::Shield));
+        }
+        if self.taskmgr_stale.load(std::sync::atomic::Ordering::Relaxed) {
+            v.insert(0, Command::new("taskmgr_update", "Mettre à jour la copie du Gestionnaire (Program Files, admin)").group("Système").icon(Icon::Shield));
         }
         // V2 : projets en cours
         for pr in &self.projects {
@@ -1541,6 +1548,7 @@ impl App {
             }
             "sample" => Action::SampleNow,
             "taskmgr" => Action::TaskmgrToggle,
+            "taskmgr_update" => Action::TaskmgrUpdate,
             "help" => {
                 self.help = true;
                 return;

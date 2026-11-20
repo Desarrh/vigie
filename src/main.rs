@@ -87,6 +87,14 @@ impl Runner {
         }
         let _ = buf.present();
         app.last_frame_ms = t0.elapsed().as_secs_f32() * 1000.0;
+        // mesure du démarrage (tools/mesure.ps1) : première image avec des données, une seule fois
+        if app.snap.is_some() && std::env::var_os("VIGIE_TRACE_DEMARRAGE").is_some() {
+            if let Some(d) = DEPART.get() {
+                eprintln!("premiere image avec donnees : {:.0} ms ; premiere mesure {:.0} ms ({})", d.elapsed().as_secs_f32() * 1000.0, app.snap.as_ref().map(|s| s.cost_ms).unwrap_or(0.0), app.snap.as_ref().map(|s| s.parts.as_str()).unwrap_or(""));
+                // SAFETY : un seul thread lit cette variable, et seulement ici
+                unsafe { std::env::remove_var("VIGIE_TRACE_DEMARRAGE") };
+            }
+        }
     }
 
     fn save(&mut self) {
@@ -98,6 +106,9 @@ impl Runner {
                 }
             }
             app.s.save();
+            if let Some(s) = &app.snap {
+                journal::Releve::save(&s.procs);
+            }
         }
     }
 }
@@ -348,7 +359,11 @@ fn capture_offscreen(path: &str) -> i32 {
     0
 }
 
+/// Instant du lancement (mesure « fenêtre utilisable en moins de 300 ms », DIRECTION.md).
+static DEPART: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
 fn main() {
+    DEPART.get_or_init(Instant::now);
     socle::crash::install("Vigie", env!("CARGO_PKG_VERSION"));
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(i) = args.iter().position(|a| a == "--set-taskmgr") {
@@ -384,7 +399,10 @@ fn main() {
     if args.iter().any(|a| a == "--couper-dev") {
         let (srv, dk, wsl) = (args.iter().any(|a| a == "--serveurs"), args.iter().any(|a| a == "--docker"), args.iter().any(|a| a == "--wsl"));
         let all = !(srv || dk || wsl);
-        let c = cli::couper(all || srv, all || dk, all || wsl);
+        // --seulement cle1,cle2 : ne couper que ce qu'Ultimate a montré (clés `cle` de --etat-dev)
+        let seulement: Option<std::collections::HashSet<String>> =
+            args.iter().position(|a| a == "--seulement").and_then(|i| args.get(i + 1)).map(|l| l.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect());
+        let c = cli::couper(all || srv, all || dk, all || wsl, seulement.as_ref());
         if json {
             println!("{}", serde_json::to_string(&c).unwrap_or_default());
         } else {

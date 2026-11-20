@@ -17,7 +17,7 @@ Un seul exe (~5 Mo), sans installation. Une seule fenêtre : relancer Vigie ram�
 ## Ce qu'il fait
 
 **Processus** — arbre parent/enfants ou liste à plat, tri par colonne, cellules colorées selon la charge.
-Colonnes : statut (App / Fond / Système / Suspendu / 👻 Fantôme), processeur, mémoire (privée, comme le Gestionnaire Windows),
+Colonnes : statut (App / Fond / Système / Suspendu / Fantôme), processeur, mémoire (privée, comme le Gestionnaire Windows),
 disque, GPU, mémoire GPU, ports, threads, PID. Un nœud replié affiche le total de son arbre.
 Volet de détails : graphiques CPU/RAM du processus, chemin, ligne de commande, parent, ports (cliquer ouvre `http://localhost:port`).
 Menu clic droit : basculer vers la fenêtre, fermer proprement, terminer, terminer l'arborescence, suspendre, priorité,
@@ -58,7 +58,7 @@ instant ; un clic l'épingle sous les graphiques, même si les processus sont mo
 
 **Performances** — historique CPU, mémoire (engagée, en veille), GPU, disque, réseau ; plus gros consommateurs.
 
-**🎮 Avant de jouer** (Ctrl+G) — chasse les fantômes sûrs, met en veille les apps en arrière-plan
+**Avant de jouer** (Ctrl+G) — chasse les fantômes sûrs, met en veille les apps en arrière-plan
 (navigateur, Spotify… ; ni Discord, ni Steam, ni la fenêtre au premier plan), vide la mémoire en veille (admin), passe en
 « Performances élevées » sauf si le plan actif est déjà au maximum (Ultimate…). « Quitter » restaure le plan précédent.
 
@@ -86,7 +86,7 @@ Vigie.exe --avant-jeu [--json]   sans fenêtre (~1,5 s) : fantômes sûrs, mise 
 Vigie.exe --apres-jeu [--json]   restaure le plan et réveille les apps endormies (préchargement mémoire) ; ~20 ms
 Vigie.exe --etat-dev             1 ligne JSON (format défini avec Ultimate) : serveurs de dev, Docker, WSL ; ~20–30 ms
 Vigie.exe --memoire-jeu <exe|dossier>  JSON : pic de RAM connu du jeu (ou du plus gros exe sous le dossier) et ce qu'il manque (V3)
-Vigie.exe --couper-dev [--serveurs] [--docker] [--wsl] [--json]
+Vigie.exe --couper-dev [--serveurs] [--docker] [--wsl] [--seulement cle1,cle2] [--json]
                                  arrête tout (ou ce qui est précisé), sans UAC ; résumé d'une ligne (JSON avec --json)
 ```
 
@@ -104,13 +104,14 @@ Serveur de dev = outil de dev (node, python, cargo…) de ta session qui écoute
 Jamais touchés : un arbre avec une fenêtre visible (le jeu, un éditeur), l'appelant et ses parents (Ultimate, même lancé
 via `npm run tauri dev`), Ultimate.exe, Claude Code, les processus protégés. Docker est arrêté avec `docker desktop stop`
 quand c'est possible, sinon ses processus sont terminés. WSL = `vmmemWSL` seulement (les autres VM Hyper-V ne sont pas touchées).
+Chaque élément de `--etat-dev` a une clé `cle` (`pid:date-de-création` pour un serveur, `docker`, `wsl`) : `--couper-dev --seulement <clés>` ne coupe que ce qui a été montré à l'utilisateur, et refuse un PID réutilisé entre-temps.
 Le résumé texte est aussi écrit dans `%APPDATA%\Vigie\dernier-jeu.txt`.
 
 ## Options (menu ⋯)
 
 Rafraîchissement 0,5 / 1 / 2 / 5 s · GPU par processus on/off · masquer les processus Windows · colonnes ·
 confirmation avant de terminer · **Remplacer le Gestionnaire des tâches** (Ctrl+Maj+Échap ouvre Vigie ; clé
-`Image File Execution Options\taskmgr.exe`, admin demandé une fois ; décocher rend la main à Windows — ne déplace pas l'exe tant que c'est coché) ·
+`Image File Execution Options\taskmgr.exe` vers une copie dans `%ProgramFiles%\Vigie`, admin demandé ; décocher efface la clé et la copie. Si la copie devient plus ancienne que Vigie, un message propose de la mettre à jour. En cas de souci : `Vigie.exe --set-taskmgr off`) ·
 relancer en administrateur.
 
 Réglages et liste blanche : `%APPDATA%\Vigie\settings.json`. Plantages : `%APPDATA%\Vigie\crash.log`.
@@ -120,11 +121,11 @@ Réglages et liste blanche : `%APPDATA%\Vigie\settings.json`. Plantages : `%APPD
 - **Une seule lecture noyau** (`NtQuerySystemInformation`) pour tous les processus : CPU, mémoire, E/S, threads, état suspendu —
   comme System Informer. Chemins et lignes de commande lus une fois par processus et mis en cache.
 - **Aucun polling inutile** : un thread mesure à l'intervalle choisi puis dort sur un canal ; l'interface ne redessine qu'à réception
-  d'une mesure ou d'une action. Fenêtre réduite → une mesure toutes les 3 s minimum.
+  d'une mesure ou d'une action. Fenêtre réduite, ou jeu / vidéo en plein écran → une mesure toutes les 10 s, sans compteurs GPU, disque ni réseau, et aucune image.
 - **Rendu CPU** (egui + softbuffer, pas de contexte GPU) : pas de ~150 Mo de pilote, et Vigie ne réveille jamais la carte graphique pendant un jeu.
 - GPU / disque / réseau via une seule requête PDH. Ports via IP Helper (~0,5 ms).
 
-Mesuré (release, 16 cœurs, ~370 processus) : **~7 ms par mesure** sur un thread, image ~3–4 ms, **~45–50 Mo** de mémoire privée.
+Mesures (`tools\mesure.ps1`, détail dans [STACK.md](STACK.md) §7) : fenêtre ouverte **~35 Mo** privés et 1 à 2,5 % d'un cœur ; réduite **~13 Mo** et **0,08 %** ; première image en ~0,1 s ; recherche < 1 ms par frappe.
 Le coût détaillé s'affiche en survolant « mesure … ms » dans la barre d'état.
 
 ## Debug et tests
